@@ -19,6 +19,7 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 import os
+import time
 from transformers import AutoTokenizer, AutoModel
 from model.modeling_llada import LLaDAModelLM
 
@@ -425,9 +426,17 @@ def main():
     # model = LLaDAModelLM.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True, torch_dtype=torch.bfloat16).to(device).eval()
     # tokenizer = AutoTokenizer.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True)
 
-    model = LLaDAModelLM.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True, torch_dtype=torch.bfloat16).to(device).eval()
-    tokenizer = AutoTokenizer.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True)
-    prompt = "Lily can run 12 kilometers per hour for 4 hours. After that, she runs 6 kilometers per hour. How many kilometers can she run in 8 hours?"
+    model = LLaDAModelLM.from_pretrained('/data/labshare/Param/llada', trust_remote_code=True, torch_dtype=torch.bfloat16).to(device).eval()
+    tokenizer = AutoTokenizer.from_pretrained('/data/labshare/Param/llada', trust_remote_code=True)
+    print('Model and tokenizer loaded.')
+
+    prompt = "介绍一下什么是计算机体系结构"
+
+    # Exclude model loading from timing. End-to-end timing starts when the
+    # already-loaded model begins processing this prompt.
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    request_start = time.perf_counter()
 
     # Add special tokens for the Instruct model. The Base model does not require the following two lines.
     m = [{"role": "user", "content": prompt}, ]
@@ -435,14 +444,52 @@ def main():
 
     input_ids = tokenizer(prompt)['input_ids']
     input_ids = torch.tensor(input_ids).to(device).unsqueeze(0)
+
+    # Synchronize before starting the generation-only timer so asynchronous
+    # CUDA work from prompt preparation is not included.
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    generation_start = time.perf_counter()
+
     with torch.inference_mode():
         nvtx.range_push("INFER")
 
-        out = generate_with_dual_cache(model, input_ids, steps=128, gen_length=128, block_length=32, temperature=0., remasking='low_confidence')
-    
-        torch.cuda.synchronize()
+        out, nfe = generate_with_dual_cache(model, input_ids, steps=128, gen_length=256, block_length=32, temperature=0., remasking='low_confidence')
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         nvtx.range_pop()
-    print(tokenizer.batch_decode(out[0][:, input_ids.shape[1]:], skip_special_tokens=True)[0])
+
+    generation_end = time.perf_counter()
+    response_ids = out[:, input_ids.shape[1]:]
+    response = tokenizer.batch_decode(
+        response_ids,
+        skip_special_tokens=True,
+    )[0]
+    completion_tokens = len(
+        tokenizer.encode(response, add_special_tokens=False)
+    )
+    prompt_tokens = int(input_ids.shape[1])
+    request_end = time.perf_counter()
+    generation_time = generation_end - generation_start
+    request_time = request_end - request_start
+    generation_tps = (
+        completion_tokens / generation_time if generation_time > 0 else 0.0
+    )
+    end_to_end_tps = (
+        completion_tokens / request_time if request_time > 0 else 0.0
+    )
+
+    print('\nFinal response:')
+    print(response)
+    print('\nPerformance statistics:')
+    print(f'  Prompt tokens: {prompt_tokens}')
+    print(f'  Completion tokens: {completion_tokens}')
+    print(f'  Number of forward evaluations (NFE): {nfe}')
+    print(f'  Generation time: {generation_time:.4f} seconds')
+    print(f'  End-to-end time: {request_time:.4f} seconds')
+    print(f'  Generation TPS: {generation_tps:.2f} token/s')
+    print(f'  End-to-end TPS: {end_to_end_tps:.2f} token/s')
 
 if __name__ == '__main__':
     main()
