@@ -101,6 +101,147 @@ cd llada
 python app.py
 ```
 
+#### OpenAI-Compatible API Server
+
+Start the Fast-dLLM v1 LLaDA server from the repository root:
+
+```bash
+python v1/llada/fastdllm_server.py \
+  --gen-length 256 \
+  --block-size 32 \
+  --cache-mode dual
+```
+
+These are the only inference arguments needed at startup. The server follows
+the original `generate.py` defaults: 128 total diffusion steps and
+`threshold=None`. The generation functions divide the total steps by the number
+of blocks internally. Model path, served model name, host, port, device, and
+dtype use defaults in `fastdllm_server.py`; they can be overridden with the
+corresponding `FASTDLLM_*` environment variables when necessary.
+
+For example, set `FASTDLLM_MODEL_PATH` to use another local model, or set
+`FASTDLLM_API_KEY` to require an `Authorization: Bearer ...` header. Without the
+API key environment variable, authentication is disabled.
+
+Call the non-streaming Chat Completions endpoint:
+
+```bash
+curl http://127.0.0.1:7004/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "/data/labshare/Param/llada",
+    "messages": [{"role": "user", "content": "Introduce Fast-dLLM."}],
+    "max_tokens": 256,
+    "temperature": 0
+  }'
+```
+
+The server also provides `GET /health` and `GET /v1/models`. Requests with
+`stream=true` return HTTP 400 because LLaDA masked-diffusion decoding does not
+produce stable incremental tokens. The response's extra `fastdllm` object reports
+the number of forward evaluations, generation time, and generation TPS.
+
+Python clients can use the standard OpenAI SDK by setting the base URL:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:7004/v1", api_key="empty")
+response = client.chat.completions.create(
+    model="/data/labshare/Param/llada",
+    messages=[{"role": "user", "content": "Introduce Fast-dLLM."}],
+    max_tokens=256,
+)
+print(response.choices[0].message.content)
+```
+
+#### Agent-name-first planner decoding
+
+`llada/agent_priority.py` adds an optional catalog-constrained planner mode to
+all three LLaDA generation functions (`generate`, Prefix Cache, and Dual
+Cache). It reserves a compact routing region in the first block for up to four
+complete Agent names, while the ordinary Fast-dLLM transfer policy continues
+to decode task tokens. The public result is always rendered as four slots:
+
+```text
+<subtask>
+agent_name: search_agent
+task: search recent diffusion acceleration methods
+</subtask>
+
+<subtask>
+agent_name: none
+task: none
+</subtask>
+```
+
+The other two slots follow the same format. `none` is built in and is never
+preloaded. Every other name must appear in the configured Agent Catalog; see
+`llada/config/agent_catalog.example.json` for cold-start, wrong-preload-cost, and
+residency fields.
+
+Run the one-shot example from `v1/llada`:
+
+```bash
+python inference.py \
+  --catalog config/agent_catalog.example.json \
+  --gen-length 128 \
+  --steps 128 \
+  --block-size 32 \
+  --policy now \
+  --cache-mode prefix \
+  --agent-log-path logs/agent_decode.log \
+  --save-step-trace \
+  --step-trace-path traces/decode_trace.jsonl
+```
+
+Verbose output is written to `agent_decode.log` by default instead of being
+printed to the terminal. `--agent-log-path` selects another file. Logs rotate
+at 20 MiB and retain three backups. The file records every slot's field-level
+candidate probabilities, top-1/top-2 margin, distribution change, consecutive
+stable steps, state transition, preload benefit, and the non-blocking
+`PRELOAD_START`, `PRELOAD_CANCEL`, `PRELOAD_SWITCH`, and `AGENT_CONFIRMED`
+events. The planner server provides the equivalent `--agent_log_path` option.
+
+The default state-machine configuration tolerates one transient confidence
+drop before cancelling a tentative preload. A field below the normal
+confirmation probability can also confirm through the stable-plateau path
+after four consistent steps (`probability >= 0.52`, `margin >= 0.20`, and
+distribution change `<= 0.02`). These values are configurable through
+`AgentPriorityConfig`. Decode-time estimation is reset by `generate*` after
+model loading and uses a clipped EMA so a slow first Dual Cache forward does
+not dominate preload-benefit estimates.
+
+`--save-step-trace` is disabled by default. When enabled, one JSON object is
+written after every forward/transfer step. Each line contains only a readable
+`response`; unresolved positions appear as `MASK`, and the line number is the
+decoding-step order. The trace is streamed to JSONL and overwrites an existing
+file at `--step-trace-path`. This diagnostic mode copies the state to CPU and
+flushes every step, so disable it for latency/throughput benchmarks.
+
+`--policy` selects the prompt/Agent strategy independently from `--cache-mode`:
+
+| Policy | Prompt | Agent-priority controller | Output |
+|---|---|---|---|
+| `raw` | Original user query | Off | Original model text |
+| `mid` | Compact planner prompt | Off | Original model text |
+| `now` | Compact planner prompt | On | Four rendered `<subtask>` slots |
+
+For strict original LLaDA use `--policy raw --cache-mode none`. For the
+same-prompt Dual Cache baseline use `--policy mid --cache-mode dual`. The
+current Agent-name-first implementation is `--policy now --cache-mode dual`.
+The planner server exposes the same `--policy` option (with its existing
+`--cache_mode` spelling). At the Python API level, omitting `agent_controller`
+still preserves the original `generate*` behavior.
+
+Run the CPU-only unit and integration tests without loading LLaDA weights:
+
+```bash
+cd v1/llada
+pip install -r ../requirements-test.txt
+python -m pytest -q tests/test_agent_priority.py tests/test_generate_agent_integration.py
+```
+
 #### Model Evaluation
 | Benchmark         | Gen Length | LLaDA   | +Cache         | +Parallel      | +Cache+Parallel (Fast-dLLM) |
 |-------------------|------------|---------|----------------|----------------|-----------------------------|

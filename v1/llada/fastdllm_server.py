@@ -26,8 +26,8 @@ from generate import generate, generate_with_dual_cache, generate_with_prefix_ca
 from model.modeling_llada import LLaDAModelLM
 
 
-# Match the original generate.py main(): total diffusion steps are fixed and
-# generate*() divides them by the number of blocks internally.
+# Default to the original total diffusion-step count. The server CLI can
+# override this independently of the requested generation length.
 TOTAL_STEPS = 128
 MODEL_PATH = os.getenv("FASTDLLM_MODEL_PATH", "/data/labshare/Param/llada")
 SERVED_MODEL_NAME = os.getenv("FASTDLLM_SERVED_MODEL_NAME", MODEL_PATH)
@@ -79,6 +79,7 @@ class ServerConfig:
     cache_mode: str
     block_size: int
     gen_length: int
+    steps: int
     api_key: Optional[str]
 
 
@@ -140,14 +141,14 @@ class LLaDARuntime:
             math.ceil(visible_tokens / self.config.block_size) * self.config.block_size,
         )
         num_blocks = gen_length // self.config.block_size
-        if TOTAL_STEPS % num_blocks != 0:
+        if self.config.steps % num_blocks != 0:
             raise ValueError(
                 f"The effective gen_length={gen_length} creates {num_blocks} "
-                f"blocks, but the original total steps={TOTAL_STEPS} is not "
+                f"blocks, but configured steps={self.config.steps} is not "
                 "divisible by that block count. Choose max_tokens and block_size "
-                "that produce a divisor of 128 blocks."
+                "that produce a divisor of steps."
             )
-        return visible_tokens, gen_length, TOTAL_STEPS
+        return visible_tokens, gen_length, self.config.steps
 
     @staticmethod
     def _apply_stop(
@@ -197,6 +198,7 @@ class LLaDARuntime:
             "dual": generate_with_dual_cache,
         }[self.config.cache_mode]
         mask_id = self.tokenizer.mask_token_id or 126336
+        torch.cuda.synchronize(self.device)
         started_at = time.perf_counter()
         with torch.inference_mode():
             output_ids, nfe = generate_fn(
@@ -208,8 +210,9 @@ class LLaDARuntime:
                 temperature=request.temperature,
                 remasking="low_confidence",
                 mask_id=mask_id,
-                threshold=None,
+                threshold=0.9,
             )
+        torch.cuda.synchronize(self.device)
         elapsed = time.perf_counter() - started_at
 
         suffix_ids = output_ids[0, input_ids.shape[1]:input_ids.shape[1] + visible_tokens]
@@ -243,7 +246,15 @@ class LLaDARuntime:
         metrics = {
             "nfe": int(nfe),
             "generation_time": elapsed,
-            "generation_tps": completion_tokens / elapsed if elapsed > 0 else 0.0,
+
+            # 固定生成槽位速度
+            "slot_tps": visible_tokens / elapsed if elapsed > 0 else 0.0,
+
+            # 实际返回文本速度
+            "useful_tps": completion_tokens / elapsed if elapsed > 0 else 0.0,
+
+            "generated_slots": visible_tokens,
+            "useful_tokens": completion_tokens,
             "steps": steps,
             "block_size": self.config.block_size,
             "cache_mode": self.config.cache_mode,
@@ -400,6 +411,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--block-size", type=int, default=32)
     parser.add_argument("--gen-length", type=int, default=256)
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=TOTAL_STEPS,
+        help="Total diffusion steps per request, independent of gen-length.",
+    )
     return parser.parse_args()
 
 
@@ -408,13 +425,15 @@ def validate_config(args: argparse.Namespace) -> None:
         raise ValueError("block-size must be greater than zero.")
     if args.gen_length <= 0:
         raise ValueError("gen-length must be greater than zero.")
+    if args.steps <= 0:
+        raise ValueError("steps must be greater than zero.")
     if args.gen_length % args.block_size != 0:
         raise ValueError("gen-length must be divisible by block-size.")
     num_blocks = args.gen_length // args.block_size
-    if TOTAL_STEPS % num_blocks != 0:
+    if args.steps % num_blocks != 0:
         raise ValueError(
-            f"gen-length/block-size creates {num_blocks} blocks, but the original "
-            f"total steps={TOTAL_STEPS} must be divisible by the block count."
+            f"gen-length/block-size creates {num_blocks} blocks, but "
+            f"steps={args.steps} must be divisible by the block count."
         )
 
 
@@ -431,6 +450,7 @@ def main() -> None:
             cache_mode=args.cache_mode,
             block_size=args.block_size,
             gen_length=args.gen_length,
+            steps=args.steps,
             api_key=API_KEY,
         )
     )

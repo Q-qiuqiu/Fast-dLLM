@@ -1,266 +1,221 @@
-# Copyright 2025 NVIDIA CORPORATION & AFFILIATES
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# SPDX-License-Identifier: Apache-2.0
-
-"""One-shot LLaDA planner inference with a first-block MASK_SLOT route.
-
-Edit ``PLANNER_TASK`` and ``AGENT_NAMES`` below to change the static request.
-Unlike ``chat.py``, this script performs exactly one generation and exits.
-"""
+"""One-shot multi-Agent planner using LLaDA agent-name-first decoding."""
 
 import argparse
 import json
+import logging
+import time
+from pathlib import Path
 
 import torch
-from transformers import AutoTokenizer
 
-from generate import (
-    build_agent_route_template,
-    generate,
-    generate_with_dual_cache,
-    generate_with_prefix_cache,
-    max_agent_slots_for_block,
+from agent_priority import (
+    AgentDecodingController,
+    AgentEventType,
+    AgentPriorityConfig,
+    AgentSpec,
+    catalog_from_dicts,
+    configure_agent_file_logging,
 )
-from model.modeling_llada import LLaDAModelLM
+from generate import generate, generate_with_dual_cache, generate_with_prefix_cache
+from step_trace import StepTraceWriter
 
 
-# ---------------------------------------------------------------------------
-# Static planner input. Edit these constants for your own multi-agent scenario.
-# IDs in the generated route are 1-based in the same order as AGENT_NAMES;
-# ID 0 means that a preallocated slot is unused.
-# ---------------------------------------------------------------------------
-AGENT_NAMES = [
-    "researcher",
-    "coder",
-    "reviewer",
-    "writer",
-    "tool_agent",
+DEFAULT_CATALOG = [
+    AgentSpec("search_agent", cold_start_seconds=3.0, wrong_preload_cost_seconds=0.4),
+    AgentSpec("code_agent", cold_start_seconds=5.0, wrong_preload_cost_seconds=0.8),
+    AgentSpec("summary_agent", cold_start_seconds=2.0, wrong_preload_cost_seconds=0.2),
 ]
 
-PLANNER_TASK = """
-分析 Fast-dLLM v1 中 LLaDA 的推理加速实现，并完成以下目标：
-1. 说明 block-wise diffusion、Prefix Cache 和 Dual Cache 的区别；
-2. 检查当前 routing MASK_SLOT 解码策略可能存在的问题；
-3. 给出可以落地的代码修改建议；
-4. 最后汇总为一份结构清晰的技术报告。
-
-请把任务拆成可以并行执行的子任务，并为每个子任务选择最合适的 agent。
-""".strip()
-
-MASK_ID = 126336
+DEFAULT_TASK = """分析 Fast-dLLM v1 的 LLaDA 解码实现，检索扩散模型加速方法，修改代码并总结结果。请拆成最多四个可并行子任务。"""
 
 
-class StepTraceRecorder:
-    """Record only the human-readable partial response after every forward pass."""
-
-    def __init__(self, tokenizer, prompt_length):
-        self.tokenizer = tokenizer
-        self.prompt_length = prompt_length
-        self.steps = []
-
-    def decode_with_masks(self, token_ids):
-        pieces = []
-        decoded_run = []
-
-        def flush_decoded_run():
-            if decoded_run:
-                pieces.append(
-                    self.tokenizer.decode(decoded_run, skip_special_tokens=False)
-                )
-                decoded_run.clear()
-
-        for token_id in token_ids:
-            if token_id == MASK_ID:
-                flush_decoded_run()
-                pieces.append("MASK")
-            else:
-                decoded_run.append(token_id)
-        flush_decoded_run()
-        return "".join(pieces)
-
-    def __call__(self, nfe, block_index, block_step, state):
-        suffix_ids = state[0, self.prompt_length:].detach().cpu()
-        self.steps.append(
-            {
-                "step": nfe,
-                "content": self.decode_with_masks(suffix_ids.tolist()),
-            }
-        )
-
-    def save(self, path):
-        with open(path, "w", encoding="utf-8") as file:
-            json.dump(self.steps, file, ensure_ascii=False, indent=2)
+def load_catalog(path):
+    if path is None:
+        return DEFAULT_CATALOG
+    with Path(path).open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, list):
+        raise ValueError("Agent Catalog JSON must be a list of objects.")
+    return catalog_from_dicts(payload)
 
 
-def build_static_prompt(tokenizer, agent_names):
-    registry = ", ".join(
-        f"{agent_id}={name}" for agent_id, name in enumerate(agent_names, start=1)
-    )
+def planner_prompt(tokenizer, task, catalog):
+    names = ", ".join(spec.name for spec in catalog)
     content = (
-        f"{PLANNER_TASK}\n\n"
-        "You are a multi-agent planner. The response suffix is already initialized "
-        "with <R>n=MASK;a=MASK,...;</R><T>. Fill n with the number of active "
-        "agents. Fill every agent MASK_SLOT with exactly one registry ID, using 0 "
-        "for unused slots. After <T>, write the detailed subtask assigned to each "
-        "selected agent. Do not output IDs outside the registry and do not repeat "
-        "the routing header. Agent registry: "
-        f"0=unused, {registry}."
+        f"{task}\n\n"
+        "You are a multi-agent planner. Select at most four agents. The decoder "
+        "owns a compact internal layout: <agents> contains four catalog names "
+        "separated by |, then <task0> through <task3> contain their corresponding "
+        "task descriptions. Use the exact name 'none' and task 'none' for unused "
+        f"slots. Never invent an agent. Registered agents: {names}."
     )
-    messages = [{"role": "user", "content": content}]
-    rendered = tokenizer.apply_chat_template(
-        messages,
+    return tokenizer.apply_chat_template(
+        [{"role": "user", "content": content}],
         add_generation_prompt=True,
         tokenize=False,
     )
-    return rendered
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Run one static multi-agent planner request with LLaDA."
-    )
-    parser.add_argument(
-        "--model_path",
-        type=str,
-        default="/data/labshare/Param/llada",
-    )
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--gen_length", type=int, default=128)
-    parser.add_argument("--steps", type=int, default=128)
-    parser.add_argument("--block_size", type=int, default=32)
-    parser.add_argument("--agent_slots", type=int, default=len(AGENT_NAMES))
-    parser.add_argument(
-        "--cache_mode",
-        choices=("none", "prefix", "dual"),
-        default="prefix",
-    )
-    parser.add_argument("--threshold", type=float, default=0.9)
-    parser.add_argument("--priority_threshold", type=float, default=0.45)
-    parser.add_argument("--priority_margin_threshold", type=float, default=0.20)
-    parser.add_argument(
-        "--trace_path",
-        type=str,
-        default="decode_trace.json",
-        help="Save each step as human-readable text; unresolved positions are MASK.",
-    )
-    parser.add_argument("--seed", type=int, default=0)
-    return parser.parse_args()
-
-
-def validate_generation_config(args):
-    if args.gen_length % args.block_size != 0:
-        raise ValueError("gen_length must be divisible by block_size.")
-    num_blocks = args.gen_length // args.block_size
-    if args.steps % num_blocks != 0:
-        raise ValueError("steps must be divisible by the number of blocks.")
-
-    steps_per_block = args.steps // num_blocks
-    if args.cache_mode == "dual" and steps_per_block < args.block_size:
-        raise ValueError(
-            "Dual Cache uses a fixed per-block loop. Set steps >= gen_length so "
-            "an unfinished block cannot be skipped."
+def render_policy_prompt(tokenizer, query, catalog, policy):
+    if policy == "raw":
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": query}],
+            add_generation_prompt=True,
+            tokenize=False,
         )
+    return planner_prompt(tokenizer, query, catalog)
+
+
+def simulated_preload(event):
+    """Example callback; this runs on the dispatcher's daemon worker."""
+
+    if event.event_type == AgentEventType.PRELOAD_START:
+        logging.getLogger("fastdllm.agent_priority.loader").info(
+            "simulate load %s", event.agent_name
+        )
+    elif event.event_type == AgentEventType.PRELOAD_CANCEL:
+        logging.getLogger("fastdllm.agent_priority.loader").info(
+            "simulate cancel %s", event.previous_agent_name
+        )
+    elif event.event_type == AgentEventType.PRELOAD_SWITCH:
+        logging.getLogger("fastdllm.agent_priority.loader").info(
+            "simulate switch %s -> %s",
+            event.previous_agent_name,
+            event.agent_name,
+        )
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model-path", default="/data/labshare/Param/llada")
+    parser.add_argument("--catalog", default="config/agent_catalog.example.json", help="Path to an Agent Catalog JSON file.")
+    parser.add_argument("--query", "--task", dest="query", default=DEFAULT_TASK)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--gen-length", type=int, default=128)
+    parser.add_argument("--steps", type=int, default=128)
+    parser.add_argument("--block-size", type=int, default=32)
+    parser.add_argument("--cache-mode", choices=("none", "prefix", "dual"), default="dual")
+    parser.add_argument(
+        "--policy",
+        choices=("raw", "mid", "now"),
+        default="now",
+        help=(
+            "raw: query prompt + original decoder; mid: planner prompt + "
+            "original decoder; now: planner prompt + Agent-priority decoder."
+        ),
+    )
+    parser.add_argument("--log-level", default="INFO")
+    parser.add_argument(
+        "--agent-log-path",
+        default="agent_decode.log",
+        help="File for verbose per-step Agent logs (rotates at 20 MiB).",
+    )
+    parser.add_argument(
+        "--save-step-trace",
+        action="store_true",
+        help="Save the generated suffix after every diffusion step.",
+    )
+    parser.add_argument(
+        "--step-trace-path",
+        default="decode_trace.jsonl",
+        help="JSONL output used with --save-step-trace.",
+    )
+    return parser.parse_args(argv)
 
 
 def main():
+    from transformers import AutoTokenizer
+    from model.modeling_llada import LLaDAModelLM
+
     args = parse_args()
-    validate_generation_config(args)
-    torch.manual_seed(args.seed)
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    agent_log_path = configure_agent_file_logging(
+        args.agent_log_path,
+        level=getattr(logging, args.log_level.upper()),
+    )
+    if args.gen_length % args.block_size:
+        raise ValueError("gen-length must be divisible by block-size.")
+    blocks = args.gen_length // args.block_size
+    if args.steps % blocks:
+        raise ValueError("steps must be divisible by the number of blocks.")
 
+    catalog = load_catalog(args.catalog) if args.policy != "raw" else DEFAULT_CATALOG
     device = torch.device(args.device)
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_path,
-        trust_remote_code=True,
-    )
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    rendered = render_policy_prompt(tokenizer, args.query, catalog, args.policy)
+    prompt = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
+    mask_id = tokenizer.mask_token_id or 126336
 
-    capacity = max_agent_slots_for_block(
-        tokenizer=tokenizer,
-        block_length=args.block_size,
-        agent_names=AGENT_NAMES,
-    )
-    if args.agent_slots > capacity:
-        raise ValueError(
-            f"block_size={args.block_size} fits at most {capacity} agent "
-            f"MASK_SLOTs for this tokenizer; requested {args.agent_slots}."
+    controller = None
+    if args.policy == "now":
+        controller = AgentDecodingController(
+            tokenizer=tokenizer,
+            config=AgentPriorityConfig(catalog=catalog, slots=4),
+            prompt_length=prompt.shape[1],
+            gen_length=args.gen_length,
+            block_length=args.block_size,
+            total_steps=args.steps,
+            mask_id=mask_id,
+            event_callback=simulated_preload,
         )
-
-    route_template = build_agent_route_template(
-        tokenizer=tokenizer,
-        gen_length=args.gen_length,
-        block_length=args.block_size,
-        agent_names=AGENT_NAMES,
-        num_agent_slots=args.agent_slots,
-        device=device,
-    )
-
-    rendered_prompt = build_static_prompt(tokenizer, AGENT_NAMES)
-    input_ids = tokenizer(rendered_prompt, return_tensors="pt").input_ids.to(device)
-    trace_recorder = StepTraceRecorder(
-        tokenizer=tokenizer,
-        prompt_length=input_ids.shape[1],
-    )
-
     model = LLaDAModelLM.from_pretrained(
         args.model_path,
         trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
     ).to(device).eval()
-
-    generation_kwargs = {
-        "model": model,
-        "prompt": input_ids,
-        "steps": args.steps,
-        "gen_length": args.gen_length,
-        "block_length": args.block_size,
-        "temperature": 0.0,
-        "remasking": "low_confidence",
-        "threshold": args.threshold,
-        "suffix_template": route_template.suffix_template,
-        "priority_mask": route_template.priority_mask,
-        "constraint_ids": route_template.constraint_ids,
-        "priority_threshold": args.priority_threshold,
-        "priority_margin_threshold": args.priority_margin_threshold,
-        "step_callback": trace_recorder,
-    }
-
     generate_fn = {
         "none": generate,
         "prefix": generate_with_prefix_cache,
         "dual": generate_with_dual_cache,
     }[args.cache_mode]
+    trace_writer = None
+    if args.save_step_trace:
+        trace_writer = StepTraceWriter(
+            tokenizer=tokenizer,
+            prompt_length=prompt.shape[1],
+            mask_id=mask_id,
+            path=args.step_trace_path,
+        )
+    started = time.perf_counter()
+    try:
+        with torch.inference_mode():
+            output, nfe = generate_fn(
+                model=model,
+                prompt=prompt,
+                steps=args.steps,
+                gen_length=args.gen_length,
+                block_length=args.block_size,
+                temperature=0.0,
+                remasking="low_confidence",
+                mask_id=mask_id,
+                threshold=None,
+                agent_controller=controller,
+                step_callback=trace_writer,
+            )
+    finally:
+        if trace_writer is not None:
+            trace_writer.close()
+    elapsed = time.perf_counter() - started
 
-    with torch.inference_mode():
-        output_ids, _ = generate_fn(**generation_kwargs)
-
-    suffix_ids = output_ids[:, input_ids.shape[1]:]
-    route_count, selected_agents = route_template.parse(suffix_ids)
-    task_token_ids = suffix_ids[0, route_template.route_token_length:].tolist()
-    if tokenizer.eos_token_id in task_token_ids:
-        task_token_ids = task_token_ids[:task_token_ids.index(tokenizer.eos_token_id)]
-    task_text = tokenizer.decode(task_token_ids, skip_special_tokens=True).strip()
-    task_text = task_text.replace("<T>", "\n").replace("</T>", "\n").strip()
-
-    route_lines = [f"count={route_count}"]
-    route_lines.extend(
-        f"agent_{index}={agent_name}"
-        for index, (_, agent_name) in enumerate(selected_agents)
+    if args.policy == "now":
+        print(controller.plan(output).render())
+        controller.dispatcher.drain()
+    else:
+        suffix = output[0, prompt.shape[1] :]
+        print(tokenizer.decode(suffix, skip_special_tokens=True))
+    if controller is not None:
+        controller.dispatcher.close(wait=True)
+    logging.getLogger("fastdllm.agent_priority").info(
+        "generation_summary policy=%s cache_mode=%s nfe=%d elapsed_seconds=%.3f log_path=%s",
+        args.policy,
+        args.cache_mode,
+        nfe,
+        elapsed,
+        agent_log_path,
     )
-    formatted_response = (
-        "<R>\n"
-        + "\n".join(route_lines)
-        + "\n</R>\n<T>\n"
-        + task_text
-        + "\n</T>"
-    )
-
-    trace_recorder.save(args.trace_path)
-    print(formatted_response)
 
 
 if __name__ == "__main__":

@@ -3,12 +3,13 @@
 import argparse
 import asyncio
 import json
+import logging
 import math
 import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 import uvicorn
@@ -18,22 +19,20 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from transformers import AutoTokenizer
 
-from generate import (
-    build_agent_route_template,
-    generate,
-    generate_with_dual_cache,
-    generate_with_prefix_cache,
-    max_agent_slots_for_block,
+from agent_priority import (
+    AgentDecodingController,
+    AgentPriorityConfig,
+    AgentSpec,
+    configure_agent_file_logging,
 )
+from generate import generate, generate_with_dual_cache, generate_with_prefix_cache
 from model.modeling_llada import LLaDAModelLM
 
 
 DEFAULT_AGENT_NAMES = [
-    "researcher",
-    "coder",
-    "reviewer",
-    "writer",
-    "tool_agent",
+    "search_agent",
+    "code_agent",
+    "summary_agent",
 ]
 
 
@@ -81,6 +80,7 @@ class ServerConfig:
     threshold: float
     priority_threshold: float
     priority_margin_threshold: float
+    policy: str
     api_key: Optional[str]
 
 
@@ -90,7 +90,6 @@ class LLaDAPlannerRuntime:
         self.device = torch.device(config.device)
         self.tokenizer = None
         self.model = None
-        self.slot_capacity = 0
         self.lock = None
 
     def load(self):
@@ -98,18 +97,6 @@ class LLaDAPlannerRuntime:
             self.config.model_path,
             trust_remote_code=True,
         )
-        self.slot_capacity = max_agent_slots_for_block(
-            tokenizer=self.tokenizer,
-            block_length=self.config.block_size,
-            agent_names=self.config.agent_names,
-        )
-        if self.config.agent_slots > self.slot_capacity:
-            raise ValueError(
-                f"block_size={self.config.block_size} fits at most "
-                f"{self.slot_capacity} agent MASK_SLOTs; requested "
-                f"{self.config.agent_slots}."
-            )
-
         self.model = LLaDAModelLM.from_pretrained(
             self.config.model_path,
             trust_remote_code=True,
@@ -182,30 +169,6 @@ class LLaDAPlannerRuntime:
         indices = [text.find(value) for value in stops if value and value in text]
         return text[:min(indices)] if indices else text
 
-    def format_response(self, suffix_ids, route_template, visible_tokens, stop):
-        route_count, selected_agents = route_template.parse(suffix_ids)
-        visible_end = min(visible_tokens, suffix_ids.shape[1])
-        task_ids = suffix_ids[0, route_template.route_token_length:visible_end].tolist()
-        eos_token_id = self.tokenizer.eos_token_id
-        if eos_token_id is not None and eos_token_id in task_ids:
-            task_ids = task_ids[:task_ids.index(eos_token_id)]
-        task_text = self.tokenizer.decode(task_ids, skip_special_tokens=True).strip()
-        task_text = task_text.replace("<T>", "\n").replace("</T>", "\n").strip()
-        task_text = self.apply_stop(task_text, stop).strip()
-
-        route_lines = [f"count={route_count}"]
-        route_lines.extend(
-            f"agent_{index}={agent_name}"
-            for index, (_, agent_name) in enumerate(selected_agents)
-        )
-        return (
-            "<R>\n"
-            + "\n".join(route_lines)
-            + "\n</R>\n<T>\n"
-            + task_text
-            + "\n</T>"
-        )
-
     def generate(self, request: ChatCompletionRequest):
         if request.model != self.config.served_model_name:
             raise ValueError(
@@ -219,21 +182,20 @@ class LLaDAPlannerRuntime:
 
         requested_tokens = request.max_completion_tokens or request.max_tokens
         visible_tokens, gen_length, steps = self.effective_lengths(requested_tokens)
-        route_template = build_agent_route_template(
-            tokenizer=self.tokenizer,
-            gen_length=gen_length,
-            block_length=self.config.block_size,
-            agent_names=self.config.agent_names,
-            num_agent_slots=self.config.agent_slots,
-            device=self.device,
-        )
-        if visible_tokens < route_template.route_token_length:
-            raise ValueError(
-                f"max_tokens must be at least {route_template.route_token_length} "
-                "to contain the routing header."
-            )
-
         messages = self.prepare_messages(request.messages)
+        if self.config.policy in {"mid", "now"}:
+            registry = ", ".join(self.config.agent_names)
+            messages.insert(
+                0,
+                {
+                    "role": "system",
+                    "content": (
+                        "Use the decoder's compact <agents> routing region and "
+                        "<task0> through <task3> task regions. Select only registered "
+                        f"names ({registry}) or none for unused slots."
+                    ),
+                },
+            )
         rendered_prompt = self.tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
@@ -243,6 +205,23 @@ class LLaDAPlannerRuntime:
             rendered_prompt,
             return_tensors="pt",
         ).input_ids.to(self.device)
+        mask_id = self.tokenizer.mask_token_id or 126336
+        controller = None
+        if self.config.policy == "now":
+            controller = AgentDecodingController(
+                tokenizer=self.tokenizer,
+                config=AgentPriorityConfig(
+                    catalog=[AgentSpec(name, 1.0, 0.2) for name in self.config.agent_names],
+                    slots=self.config.agent_slots,
+                    tentative_probability=self.config.priority_threshold,
+                    tentative_margin=self.config.priority_margin_threshold,
+                ),
+                prompt_length=input_ids.shape[1],
+                gen_length=gen_length,
+                block_length=self.config.block_size,
+                total_steps=steps,
+                mask_id=mask_id,
+            )
 
         generation_kwargs = {
             "model": self.model,
@@ -253,11 +232,8 @@ class LLaDAPlannerRuntime:
             "temperature": request.temperature,
             "remasking": "low_confidence",
             "threshold": self.config.threshold,
-            "suffix_template": route_template.suffix_template,
-            "priority_mask": route_template.priority_mask,
-            "constraint_ids": route_template.constraint_ids,
-            "priority_threshold": self.config.priority_threshold,
-            "priority_margin_threshold": self.config.priority_margin_threshold,
+            "mask_id": mask_id,
+            "agent_controller": controller,
         }
         generate_fn = {
             "none": generate,
@@ -268,12 +244,15 @@ class LLaDAPlannerRuntime:
         with torch.inference_mode():
             output_ids, _ = generate_fn(**generation_kwargs)
         suffix_ids = output_ids[:, input_ids.shape[1]:]
-        content = self.format_response(
-            suffix_ids,
-            route_template,
-            visible_tokens,
-            request.stop,
-        )
+        if self.config.policy == "now":
+            content = controller.plan(output_ids).render()
+        else:
+            content = self.tokenizer.decode(
+                suffix_ids[0, :visible_tokens], skip_special_tokens=True
+            )
+            content = self.apply_stop(content, request.stop).strip()
+        if controller is not None:
+            controller.dispatcher.close(wait=False)
         visible_suffix_ids = suffix_ids[0, :min(visible_tokens, suffix_ids.shape[1])].tolist()
         eos_token_id = self.tokenizer.eos_token_id
         if eos_token_id is not None and eos_token_id in visible_suffix_ids:
@@ -456,7 +435,7 @@ def parse_args():
     parser.add_argument("--block_size", type=int, default=32)
     parser.add_argument("--max_gen_length", type=int, default=256)
     parser.add_argument("--steps_per_block", type=int, default=32)
-    parser.add_argument("--agent_slots", type=int, default=5)
+    parser.add_argument("--agent_slots", type=int, default=4)
     parser.add_argument(
         "--agent_names",
         default=",".join(DEFAULT_AGENT_NAMES),
@@ -468,14 +447,29 @@ def parse_args():
     parser.add_argument("--threshold", type=float, default=0.9)
     parser.add_argument("--priority_threshold", type=float, default=0.45)
     parser.add_argument("--priority_margin_threshold", type=float, default=0.20)
+    parser.add_argument(
+        "--policy",
+        choices=("raw", "mid", "now"),
+        default="now",
+        help="Prompt/Agent policy; cache_mode remains independent.",
+    )
     parser.add_argument("--api_key", default=None)
     parser.add_argument("--log_level", default="info")
+    parser.add_argument(
+        "--agent_log_path",
+        default="agent_decode.log",
+        help="File for verbose Agent step/event logs (rotates at 20 MiB).",
+    )
     return parser.parse_args()
 
 
 def main():
     global runtime
     args = parse_args()
+    configure_agent_file_logging(
+        args.agent_log_path,
+        level=getattr(logging, args.log_level.upper()),
+    )
     agent_names = [name.strip() for name in args.agent_names.split(",") if name.strip()]
     if not agent_names:
         raise ValueError("agent_names cannot be empty.")
@@ -496,6 +490,7 @@ def main():
             threshold=args.threshold,
             priority_threshold=args.priority_threshold,
             priority_margin_threshold=args.priority_margin_threshold,
+            policy=args.policy,
             api_key=args.api_key,
         )
     )

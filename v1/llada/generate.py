@@ -18,12 +18,10 @@
 import torch
 import numpy as np
 import torch.nn.functional as F
-import os
 import time
-from transformers import AutoTokenizer, AutoModel
-from model.modeling_llada import LLaDAModelLM
 
 from torch.cuda import nvtx
+
 
 def add_gumbel_noise(logits, temperature):
     '''
@@ -85,7 +83,8 @@ def get_num_transfer_tokens(block_mask_index: torch.Tensor, steps: int) -> torch
 
 @ torch.no_grad()
 def generate(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-             remasking='low_confidence', mask_id=126336, threshold=None, factor=None):
+             remasking='low_confidence', mask_id=126336, threshold=None, factor=None,
+             agent_controller=None, step_callback=None):
     '''
     Args:
         model: Mask predictor.
@@ -100,6 +99,8 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
     '''
     x = torch.full((prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
+    if agent_controller is not None and agent_controller.enabled:
+        agent_controller.initialize(x)
 
     assert gen_length % block_length == 0
     num_blocks = gen_length // block_length
@@ -117,21 +118,46 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
             mask_index = (x == mask_id)
             logits = model(x).logits
             mask_index[:, prompt.shape[1] + (num_block + 1) * block_length:] = 0
+            if agent_controller is not None and agent_controller.enabled:
+                global_step = num_block * steps + i
+                agent_controller.observe(
+                    logits,
+                    x,
+                    logits_start=0,
+                    global_step=global_step,
+                    is_last_agent_step=(num_block == 0 and i == steps - 1),
+                )
+                mask_index = (x == mask_id)
+                mask_index[:, prompt.shape[1] + (num_block + 1) * block_length:] = 0
+                mask_index = agent_controller.decoder_mask(mask_index)
             if factor is None:
                 x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, i] if threshold is None else None, threshold)
             else:
                 x0, transfer_index = get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, None, factor)
             x[transfer_index] = x0[transfer_index]
+            if step_callback is not None:
+                step_callback(nfe, num_block, i, x)
             i += 1
-            if (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length] == mask_id).sum() == 0:
+            if (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length] == mask_id).sum() == 0 and not (
+                agent_controller is not None
+                and agent_controller.enabled
+                and num_block == 0
+                and agent_controller.has_unconfirmed_agents()
+                and i < steps
+            ):
                 break
+            if agent_controller is not None and agent_controller.enabled and i >= steps:
+                break
+    if agent_controller is not None and agent_controller.enabled:
+        agent_controller.finalize(x)
     return x, nfe
 
 
 
 @ torch.no_grad()
 def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-             remasking='low_confidence', mask_id=126336, threshold=None, factor=None):
+             remasking='low_confidence', mask_id=126336, threshold=None, factor=None,
+             agent_controller=None, step_callback=None):
     '''
     Args:
         model: Mask predictor.
@@ -146,6 +172,8 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
     '''
     x = torch.full((prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
+    if agent_controller is not None and agent_controller.enabled:
+        agent_controller.initialize(x)
 
     assert gen_length % block_length == 0
     num_blocks = gen_length // block_length
@@ -167,6 +195,17 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
 
         mask_index = (x == mask_id)
         mask_index[:, current_block_end:] = 0
+        if agent_controller is not None and agent_controller.enabled:
+            agent_controller.observe(
+                output.logits,
+                x,
+                logits_start=0,
+                global_step=num_block * steps,
+                is_last_agent_step=(num_block == 0 and steps == 1),
+            )
+            mask_index = (x == mask_id)
+            mask_index[:, current_block_end:] = 0
+            mask_index = agent_controller.decoder_mask(mask_index)
         if factor is None:
             x0, transfer_index = get_transfer_index(output.logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, 0] if threshold is None else None, threshold)
         else:
@@ -181,10 +220,20 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
         
         past_key_values = new_past_key_values
         nfe += 1
+        if step_callback is not None:
+            step_callback(nfe, num_block, 0, x)
         
         i = 1
         while True:
-            if (x[:, current_block_start:current_block_end] == mask_id).sum() == 0:
+            if (x[:, current_block_start:current_block_end] == mask_id).sum() == 0 and not (
+                agent_controller is not None
+                and agent_controller.enabled
+                and num_block == 0
+                and agent_controller.has_unconfirmed_agents()
+                and i < steps
+            ):
+                break
+            if agent_controller is not None and agent_controller.enabled and i >= steps:
                 break
             nfe += 1
             mask_index = (x[:, current_block_start:] == mask_id)
@@ -195,6 +244,20 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
             x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
 
+            if agent_controller is not None and agent_controller.enabled:
+                agent_controller.observe(
+                    logits,
+                    x,
+                    logits_start=current_block_start,
+                    global_step=num_block * steps + i,
+                    is_last_agent_step=(num_block == 0 and i == steps - 1),
+                )
+                mask_index = (x[:, current_block_start:] == mask_id)
+                mask_index[:, block_length:] = 0
+                mask_index = agent_controller.decoder_mask(
+                    mask_index, mask_start=current_block_start
+                )
+
             if factor is None:
                 x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index, 
                                                 x[:, current_block_start:], num_transfer_tokens[:, i] if threshold is None else None, threshold)
@@ -202,16 +265,20 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
                 x0, transfer_index = get_transfer_index_dynamic(logits, temperature, remasking, mask_index, 
                                                 x[:, current_block_start:], None, factor)
             x[:, current_block_start:][transfer_index] = x0[transfer_index]
+            if step_callback is not None:
+                step_callback(nfe, num_block, i, x)
             
             i += 1
 
-
+    if agent_controller is not None and agent_controller.enabled:
+        agent_controller.finalize(x)
     return x, nfe
 
 @torch.no_grad()
 def generate_with_dual_cache(
     model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
-    remasking="low_confidence", mask_id=126336, threshold=None, factor=None
+    remasking="low_confidence", mask_id=126336, threshold=None, factor=None,
+    agent_controller=None, step_callback=None
 ):
     B = prompt.shape[0]
     Lp = int(prompt.shape[1])  # Python int, not Tensor
@@ -224,6 +291,8 @@ def generate_with_dual_cache(
     # x: (B, Lp + gen_length)
     x = torch.full((B, Lp + gen_length), mask_id, dtype=torch.long, device=model.device)
     x[:, :Lp] = prompt
+    if agent_controller is not None and agent_controller.enabled:
+        agent_controller.initialize(x)
 
     nfe = 0
 
@@ -248,6 +317,17 @@ def generate_with_dual_cache(
         global_mask_index = (x == mask_id)
         # Do not touch beyond current block in this phase
         global_mask_index[:, e:] = False
+        if agent_controller is not None and agent_controller.enabled:
+            agent_controller.observe(
+                out_full.logits,
+                x,
+                logits_start=0,
+                global_step=nb * steps_per_block,
+                is_last_agent_step=(nb == 0 and steps_per_block == 1),
+            )
+            global_mask_index = (x == mask_id)
+            global_mask_index[:, e:] = False
+            global_mask_index = agent_controller.decoder_mask(global_mask_index)
 
         if factor is None:
             quota0 = None if threshold is not None else num_transfer_tokens[:, 0]  # (B,)
@@ -259,14 +339,26 @@ def generate_with_dual_cache(
                 out_full.logits, temperature, remasking, global_mask_index, x, None, factor
             )
 
+        # The full-sequence logits are no longer needed after the initial
+        # transfer. Keep only past_key_values for the block refinement so the
+        # large logits tensor can be released immediately.
+        del out_full
+
         # In-place update via torch.where (no tensor-slice assignment with mask)
         x = torch.where(transfer_index, x0, x)
+        if step_callback is not None:
+            step_callback(nfe, nb, 0, x)
 
         # 2) Semi-autoregressive refinement, fixed number of steps (graph-friendly)
         #    Each iteration runs on the current block with KV-cache and replace_position
         for i in range(1, steps_per_block):
             # Evaluate logits only for current block with cache
-            if (x[:, s:e] == mask_id).sum() == 0:
+            if (x[:, s:e] == mask_id).sum() == 0 and not (
+                agent_controller is not None
+                and agent_controller.enabled
+                and nb == 0
+                and agent_controller.has_unconfirmed_agents()
+            ):
                 break
             logits_blk = model(
                 x[:, s:e], past_key_values=past_key_values, use_cache=True, replace_position=replace_position
@@ -274,6 +366,17 @@ def generate_with_dual_cache(
 
             # Mask and quota for this step (all tensor ops)
             mask_blk = (x[:, s:e] == mask_id)  # (B, block_length)
+
+            if agent_controller is not None and agent_controller.enabled:
+                agent_controller.observe(
+                    logits_blk,
+                    x,
+                    logits_start=s,
+                    global_step=nb * steps_per_block + i,
+                    is_last_agent_step=(nb == 0 and i == steps_per_block - 1),
+                )
+                mask_blk = (x[:, s:e] == mask_id)
+                mask_blk = agent_controller.decoder_mask(mask_blk, mask_start=s)
 
             if factor is None:
                 quota_i = None if threshold is not None else num_transfer_tokens[:, i]  # (B,)
@@ -291,7 +394,15 @@ def generate_with_dual_cache(
             x = torch.cat([x[:, :s], blk_new, x[:, e:]], dim=1)  # static concatenation
 
             nfe += 1
+            if step_callback is not None:
+                step_callback(nfe, nb, i, x)
 
+        # Do not retain this block's full KV cache while the next block builds
+        # a new cache with another full-sequence forward.
+        del past_key_values
+
+    if agent_controller is not None and agent_controller.enabled:
+        agent_controller.finalize(x)
     return x, nfe
 
 
@@ -421,6 +532,9 @@ def get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, nu
     return x0, transfer_index
 
 def main():
+    from transformers import AutoTokenizer
+    from model.modeling_llada import LLaDAModelLM
+
     device = 'cuda'
 
     # model = LLaDAModelLM.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True, torch_dtype=torch.bfloat16).to(device).eval()
@@ -454,7 +568,7 @@ def main():
     with torch.inference_mode():
         nvtx.range_push("INFER")
 
-        out, nfe = generate_with_dual_cache(model, input_ids, steps=128, gen_length=256, block_length=32, temperature=0., remasking='low_confidence')
+        out, nfe = generate_with_dual_cache(model, input_ids, steps=512, gen_length=1024, block_length=32, temperature=0,threshold=None, remasking='low_confidence')
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()

@@ -1,0 +1,20 @@
+[
+  {
+    "name": "search_agent",
+    "cold_start_seconds": 30.0,
+    "wrong_preload_cost_seconds": 0.4,
+    "resident": false
+  },
+  {
+    "name": "code_agent",
+    "cold_start_seconds": 50.0,
+    "wrong_preload_cost_seconds": 0.8,
+    "resident": false
+  },
+  {
+    "name": "summary_agent",
+    "cold_start_seconds": 20.0,
+    "wrong_preload_cost_seconds": 0.2,
+    "resident": false
+  }
+]

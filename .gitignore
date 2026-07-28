@@ -8,7 +8,8 @@ v1/dream/evals_results/
 .DS_Store
 **/.DS_Store
 eval_outputs/
-
+v1/llada/*.json
+v1/llada/*.jsonl
 # Local Python / tooling (keep repo clones small)
 .venv/
 venv/
