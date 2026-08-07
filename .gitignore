@@ -10,6 +10,7 @@ v1/dream/evals_results/
 eval_outputs/
 v1/llada/*.json
 v1/llada/*.jsonl
+v1/llada/logs/*
 # Local Python / tooling (keep repo clones small)
 .venv/
 venv/

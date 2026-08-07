@@ -80,6 +80,7 @@ class ServerConfig:
     block_size: int
     gen_length: int
     steps: int
+    threshold: Optional[float]
     api_key: Optional[str]
 
 
@@ -210,7 +211,7 @@ class LLaDARuntime:
                 temperature=request.temperature,
                 remasking="low_confidence",
                 mask_id=mask_id,
-                threshold=0.9,
+                threshold=self.config.threshold,
             )
         torch.cuda.synchronize(self.device)
         elapsed = time.perf_counter() - started_at
@@ -258,6 +259,7 @@ class LLaDARuntime:
             "steps": steps,
             "block_size": self.config.block_size,
             "cache_mode": self.config.cache_mode,
+            "threshold": self.config.threshold,
         }
         return content, finish_reason, usage, metrics
 
@@ -400,6 +402,17 @@ async def chat_completions(payload: ChatCompletionRequest, request: Request):
     }
 
 
+def parse_optional_float(value: str) -> Optional[float]:
+    if value.lower() in {"none", "null"}:
+        return None
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "threshold must be a number between 0 and 1, or 'none'."
+        ) from exc
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Serve Fast-dLLM v1 LLaDA through an OpenAI-compatible API."
@@ -417,6 +430,15 @@ def parse_args() -> argparse.Namespace:
         default=TOTAL_STEPS,
         help="Total diffusion steps per request, independent of gen-length.",
     )
+    parser.add_argument(
+        "--threshold",
+        type=parse_optional_float,
+        default=0.9,
+        help=(
+            "Confidence threshold for unmasking (0 to 1). Use 'none' to "
+            "restore quota-based token transfer."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -427,6 +449,8 @@ def validate_config(args: argparse.Namespace) -> None:
         raise ValueError("gen-length must be greater than zero.")
     if args.steps <= 0:
         raise ValueError("steps must be greater than zero.")
+    if args.threshold is not None and not 0.0 <= args.threshold <= 1.0:
+        raise ValueError("threshold must be between 0 and 1, or 'none'.")
     if args.gen_length % args.block_size != 0:
         raise ValueError("gen-length must be divisible by block-size.")
     num_blocks = args.gen_length // args.block_size
@@ -451,6 +475,7 @@ def main() -> None:
             block_size=args.block_size,
             gen_length=args.gen_length,
             steps=args.steps,
+            threshold=args.threshold,
             api_key=API_KEY,
         )
     )

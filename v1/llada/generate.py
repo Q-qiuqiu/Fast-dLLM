@@ -17,7 +17,6 @@
 
 import torch
 import numpy as np
-import torch.nn.functional as F
 import time
 
 from torch.cuda import nvtx
@@ -35,6 +34,24 @@ def add_gumbel_noise(logits, temperature):
     noise = torch.rand_like(logits, dtype=torch.float64)
     gumbel_noise = (- torch.log(noise)) ** temperature
     return logits.exp() / gumbel_noise
+
+
+def get_selected_token_probability(logits, token_ids):
+    """Return selected-token softmax probabilities using stable FP32 math.
+
+    The model logits are BF16/FP16 during inference, so converting them to
+    FP64 cannot recover any input precision.  Computing only the selected
+    probabilities through logsumexp also avoids materializing a full FP32/FP64
+    probability tensor over the vocabulary.
+    """
+    logits_fp32 = logits.float()
+    selected_logits = torch.gather(
+        logits_fp32,
+        dim=-1,
+        index=token_ids.unsqueeze(-1),
+    ).squeeze(-1)
+    log_partition = torch.logsumexp(logits_fp32, dim=-1)
+    return torch.exp(selected_logits - log_partition)
 
 
 # def get_num_transfer_tokens(mask_index, steps):
@@ -428,9 +445,7 @@ def get_transfer_index(
 
     # 2) Confidence for chosen tokens (or random)
     if remasking == "low_confidence":
-        # Use higher precision for softmax stability
-        p = F.softmax(logits.to(torch.float64), dim=-1)
-        x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)  # (B, L), float64
+        x0_p = get_selected_token_probability(logits, x0)  # (B, L), float32
     elif remasking == "random":
         x0_p = torch.rand(x0.shape, device=x0.device, dtype=torch.float64)  # (B, L)
     else:
@@ -492,9 +507,7 @@ def get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, nu
     logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
     x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
     if remasking == 'low_confidence':
-        p = F.softmax(logits.to(torch.float64), dim=-1)
-        x0_p = torch.squeeze(
-            torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
+        x0_p = get_selected_token_probability(logits, x0) # b, l
     elif remasking == 'random':
         x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
     else:
