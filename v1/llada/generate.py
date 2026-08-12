@@ -313,6 +313,30 @@ def generate_with_dual_cache(
 
     nfe = 0
 
+    # JSON Agent fields live at their final, variable response positions rather
+    # than in block zero.  Dual Cache normally exposes full-sequence logits only
+    # once before switching to block-local refinement, so perform a short
+    # discovery phase before any reusable cache is built.  These forwards do not
+    # reserve output tokens; they only let the field controller locate and write
+    # the first normal JSON Agent occurrences.  Other controllers request zero
+    # discovery steps and preserve the original path.
+    discovery_steps = int(
+        getattr(agent_controller, "full_sequence_discovery_steps", 0) or 0
+    )
+    for discovery_step in range(discovery_steps):
+        discovery_output = model(x, use_cache=False)
+        agent_controller.observe(
+            discovery_output.logits,
+            x,
+            logits_start=0,
+            global_step=discovery_step,
+            is_last_agent_step=(discovery_step == discovery_steps - 1),
+        )
+        nfe += 1
+        if step_callback is not None:
+            step_callback(nfe, -1, discovery_step, x)
+        del discovery_output
+
     for nb in range(num_blocks):
         s = Lp + nb * block_length
         e = s + block_length

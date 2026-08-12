@@ -19,20 +19,21 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from transformers import AutoTokenizer
 
-from agent_priority import (
-    AgentDecodingController,
-    AgentPriorityConfig,
-    AgentSpec,
-    configure_agent_file_logging,
-)
+from agent_priority import configure_agent_file_logging
 from generate import generate, generate_with_dual_cache, generate_with_prefix_cache
+from json_agent_priority import (
+    JsonAgentFieldController,
+    JsonAgentPriorityConfig,
+    extract_agent_registry,
+)
 from model.modeling_llada import LLaDAModelLM
 
 
 DEFAULT_AGENT_NAMES = [
-    "search_agent",
     "code_agent",
-    "summary_agent",
+    "math_agent",
+    "search_agent",
+    "commonsense_agent",
 ]
 
 
@@ -80,6 +81,8 @@ class ServerConfig:
     threshold: float
     priority_threshold: float
     priority_margin_threshold: float
+    agent_anchor_margin: float
+    agent_discovery_steps: int
     policy: str
     api_key: Optional[str]
 
@@ -183,19 +186,33 @@ class LLaDAPlannerRuntime:
         requested_tokens = request.max_completion_tokens or request.max_tokens
         visible_tokens, gen_length, steps = self.effective_lengths(requested_tokens)
         messages = self.prepare_messages(request.messages)
+        request_agent_names = extract_agent_registry(
+            messages, self.config.agent_names
+        )
         if self.config.policy in {"mid", "now"}:
-            registry = ", ".join(self.config.agent_names)
-            messages.insert(
-                0,
-                {
-                    "role": "system",
-                    "content": (
-                        "Use the decoder's compact <agents> routing region and "
-                        "<task0> through <task3> task regions. Select only registered "
-                        f"names ({registry}) or none for unused slots."
-                    ),
-                },
+            registry = ", ".join(request_agent_names)
+            planner_instruction = {
+                "role": "system",
+                "content": (
+                    "Return a normal planner response with no private routing tags. "
+                    "Write PLAN_JSON before PLANNING_REASONING. In PLAN_JSON, use a "
+                    "compact JSON array without Markdown fences or indentation. Every "
+                    "object must put the agent field first and use this exact prefix: "
+                    "{\"agent\":\"<name>\",. Follow it with id, task, reason, and dep. "
+                    f"Agent names must be selected from: {registry}. Preserve the "
+                    "query's dates and numeric constraints verbatim. Do not create "
+                    "duplicate subtasks. Every object must explicitly include reason "
+                    "and dep; use dep:[] for independent tasks. Use exactly one "
+                    "standalone marker of each kind, in this order: PLAN_JSON, "
+                    "END_PLAN_JSON, PLANNING_REASONING, END_PLANNING_REASONING. "
+                    "END_PLANNING_REASONING must be the final output line."
+                ),
+            }
+            first_user = next(
+                (index for index, message in enumerate(messages) if message["role"] == "user"),
+                len(messages),
             )
+            messages.insert(first_user, planner_instruction)
         rendered_prompt = self.tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
@@ -208,18 +225,18 @@ class LLaDAPlannerRuntime:
         mask_id = self.tokenizer.mask_token_id or 126336
         controller = None
         if self.config.policy == "now":
-            controller = AgentDecodingController(
+            controller = JsonAgentFieldController(
                 tokenizer=self.tokenizer,
-                config=AgentPriorityConfig(
-                    catalog=[AgentSpec(name, 1.0, 0.2) for name in self.config.agent_names],
-                    slots=self.config.agent_slots,
+                config=JsonAgentPriorityConfig(
+                    catalog=request_agent_names,
+                    priority_slots=self.config.agent_slots,
+                    anchor_min_logit_margin=self.config.agent_anchor_margin,
                     tentative_probability=self.config.priority_threshold,
                     tentative_margin=self.config.priority_margin_threshold,
+                    discovery_steps=self.config.agent_discovery_steps,
                 ),
                 prompt_length=input_ids.shape[1],
                 gen_length=gen_length,
-                block_length=self.config.block_size,
-                total_steps=steps,
                 mask_id=mask_id,
             )
 
@@ -241,30 +258,45 @@ class LLaDAPlannerRuntime:
             "dual": generate_with_dual_cache,
         }[self.config.cache_mode]
 
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        generation_started_at = time.perf_counter()
         with torch.inference_mode():
-            output_ids, _ = generate_fn(**generation_kwargs)
+            output_ids, nfe = generate_fn(**generation_kwargs)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        generation_seconds = time.perf_counter() - generation_started_at
         suffix_ids = output_ids[:, input_ids.shape[1]:]
-        if self.config.policy == "now":
-            content = controller.plan(output_ids).render()
-        else:
-            content = self.tokenizer.decode(
-                suffix_ids[0, :visible_tokens], skip_special_tokens=True
-            )
-            content = self.apply_stop(content, request.stop).strip()
+        content = self.tokenizer.decode(
+            suffix_ids[0, :visible_tokens], skip_special_tokens=True
+        )
+        content = self.apply_stop(content, request.stop).strip()
         if controller is not None:
-            controller.dispatcher.close(wait=False)
-        visible_suffix_ids = suffix_ids[0, :min(visible_tokens, suffix_ids.shape[1])].tolist()
-        eos_token_id = self.tokenizer.eos_token_id
-        if eos_token_id is not None and eos_token_id in visible_suffix_ids:
-            completion_tokens = visible_suffix_ids.index(eos_token_id) + 1
-        else:
-            completion_tokens = len(visible_suffix_ids)
+            controller.close()
+        # OpenAI usage describes the text actually returned to the caller.  A
+        # diffusion LM always allocates a fixed output canvas, so counting the
+        # canvas (often all 1024 positions) as completion tokens substantially
+        # overstates useful throughput when special/padding tokens are skipped.
+        completion_tokens = len(
+            self.tokenizer(content, add_special_tokens=False).input_ids
+        )
+        prompt_tokens = int(input_ids.shape[1])
         usage = {
-            "prompt_tokens": int(input_ids.shape[1]),
+            "prompt_tokens": prompt_tokens,
             "completion_tokens": int(completion_tokens),
-            "total_tokens": int(input_ids.shape[1] + completion_tokens),
+            "total_tokens": prompt_tokens + int(completion_tokens),
         }
-        return content, usage
+        metrics = {
+            "nfe": int(nfe),
+            "generated_tokens": int(completion_tokens),
+            "tps": (
+                completion_tokens / generation_seconds
+                if generation_seconds > 0 else 0.0
+            ),
+        }
+        if controller is not None:
+            metrics["agent_priority"] = controller.metrics()
+        return content, usage, metrics
 
 
 runtime: Optional[LLaDAPlannerRuntime] = None
@@ -376,9 +408,11 @@ async def chat_completions(payload: ChatCompletionRequest, request: Request):
 
     try:
         async with runtime.lock:
-            content, usage = await asyncio.to_thread(runtime.generate, payload)
+            content, usage, metrics = await asyncio.to_thread(runtime.generate, payload)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
 
     if not payload.stream:
         return {
@@ -394,6 +428,7 @@ async def chat_completions(payload: ChatCompletionRequest, request: Request):
                 }
             ],
             "usage": usage,
+            "fastdllm": metrics,
         }
 
     async def stream_response():
@@ -418,6 +453,7 @@ async def chat_completions(payload: ChatCompletionRequest, request: Request):
                 "model": payload.model,
                 "choices": [],
                 "usage": usage,
+                "fastdllm": metrics,
             }
             yield f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
@@ -428,12 +464,12 @@ async def chat_completions(payload: ChatCompletionRequest, request: Request):
 def parse_args():
     parser = argparse.ArgumentParser(description="Serve LLaDA with an OpenAI API.")
     parser.add_argument("--model_path", default="/data/labshare/Param/llada")
-    parser.add_argument("--served_model_name", default="fast-dllm-llada-planner")
+    parser.add_argument("--served_model_name", default="/data/labshare/Param/llada")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=7004)
     parser.add_argument("--block_size", type=int, default=32)
-    parser.add_argument("--max_gen_length", type=int, default=256)
+    parser.add_argument("--max_gen_length", type=int, default=1024)
     parser.add_argument("--steps_per_block", type=int, default=32)
     parser.add_argument("--agent_slots", type=int, default=4)
     parser.add_argument(
@@ -448,10 +484,25 @@ def parse_args():
     parser.add_argument("--priority_threshold", type=float, default=0.45)
     parser.add_argument("--priority_margin_threshold", type=float, default=0.20)
     parser.add_argument(
+        "--agent_anchor_margin",
+        type=float,
+        default=-6.0,
+        help="Minimum mean target-vs-top logit margin for a speculative JSON Agent anchor.",
+    )
+    parser.add_argument(
+        "--agent_discovery_steps",
+        type=int,
+        default=4,
+        help=(
+            "Compatibility option. JSON Agent discovery now reuses normal "
+            "full-sequence block warm-ups and adds no extra model forwards."
+        ),
+    )
+    parser.add_argument(
         "--policy",
         choices=("raw", "mid", "now"),
         default="now",
-        help="Prompt/Agent policy; cache_mode remains independent.",
+        help="raw=unchanged prompt, mid=JSON planner prompt, now=JSON Agent-priority decoding.",
     )
     parser.add_argument("--api_key", default=None)
     parser.add_argument("--log_level", default="info")
@@ -475,6 +526,8 @@ def main():
         raise ValueError("agent_names cannot be empty.")
     if args.max_gen_length % args.block_size != 0:
         raise ValueError("max_gen_length must be divisible by block_size.")
+    if args.agent_discovery_steps <= 0:
+        raise ValueError("agent_discovery_steps must be positive.")
 
     runtime = LLaDAPlannerRuntime(
         ServerConfig(
@@ -490,6 +543,8 @@ def main():
             threshold=args.threshold,
             priority_threshold=args.priority_threshold,
             priority_margin_threshold=args.priority_margin_threshold,
+            agent_anchor_margin=args.agent_anchor_margin,
+            agent_discovery_steps=args.agent_discovery_steps,
             policy=args.policy,
             api_key=args.api_key,
         )
