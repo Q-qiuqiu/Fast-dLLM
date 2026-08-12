@@ -11,6 +11,7 @@ eval_outputs/
 v1/llada/*.json
 v1/llada/*.jsonl
 v1/llada/logs/*
+v1/llada/*.log
 # Local Python / tooling (keep repo clones small)
 .venv/
 venv/
