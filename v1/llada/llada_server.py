@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from transformers import AutoTokenizer
 
 from agent_priority import configure_agent_file_logging
+from agent_timing import AgentTimingRecorder
 from generate import generate, generate_with_dual_cache, generate_with_prefix_cache
 from json_agent_priority import (
     JsonAgentFieldController,
@@ -27,6 +28,7 @@ from json_agent_priority import (
     extract_agent_registry,
 )
 from model.modeling_llada import LLaDAModelLM
+from planner_json_repair import repair_plan_json_response
 
 
 DEFAULT_AGENT_NAMES = [
@@ -76,6 +78,7 @@ class ServerConfig:
     max_gen_length: int
     steps_per_block: int
     agent_slots: int
+    agent_timing_slots: int
     agent_names: List[str]
     cache_mode: str
     threshold: float
@@ -83,6 +86,9 @@ class ServerConfig:
     priority_margin_threshold: float
     agent_anchor_margin: float
     agent_discovery_steps: int
+    agent_timing_log_path: str
+    agent_timing_summary_path: Optional[str]
+    plan_json_repair: bool
     policy: str
     api_key: Optional[str]
 
@@ -94,6 +100,10 @@ class LLaDAPlannerRuntime:
         self.tokenizer = None
         self.model = None
         self.lock = None
+        self.timing_recorder = AgentTimingRecorder(
+            config.agent_timing_log_path,
+            config.agent_timing_summary_path,
+        )
 
     def load(self):
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -143,6 +153,42 @@ class LLaDAPlannerRuntime:
         if not has_user_message:
             raise ValueError("At least one user message is required.")
         return normalized
+
+    def record_agent_timing(
+        self,
+        *,
+        completion_id: str,
+        created: int,
+        request: ChatCompletionRequest,
+        metrics: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        query = next(
+            (
+                self.message_content_to_text(message)
+                for message in reversed(request.messages)
+                if message.role == "user"
+            ),
+            "",
+        )
+        requested_tokens = request.max_completion_tokens or request.max_tokens
+        try:
+            self.timing_recorder.record(
+                completion_id=completion_id,
+                created_unix=created,
+                query=query,
+                model=request.model,
+                temperature=request.temperature,
+                requested_max_tokens=requested_tokens,
+                metrics=metrics,
+                error=error,
+            )
+        except Exception:
+            # A late filesystem failure must be visible in the server log, but
+            # must not discard an otherwise successful benchmark response.
+            logging.getLogger("fastdllm.agent_timing").exception(
+                "Failed to persist Agent timing for %s", completion_id
+            )
 
     def effective_lengths(self, requested_tokens: Optional[int]):
         visible_tokens = requested_tokens or self.config.max_gen_length
@@ -202,7 +248,18 @@ class LLaDAPlannerRuntime:
                     f"Agent names must be selected from: {registry}. Preserve the "
                     "query's dates and numeric constraints verbatim. Do not create "
                     "duplicate subtasks. Every object must explicitly include reason "
-                    "and dep; use dep:[] for independent tasks. Use exactly one "
+                    "and dep; use dep:[] for independent tasks. Follow the caller's "
+                    "Agent capability and routing descriptions exactly. When a "
+                    "required external fact is absent from the supplied query or "
+                    "context, first create a fact-acquisition subtask using the "
+                    "caller's search, retrieval, or context Agent as appropriate. "
+                    "Never ask a math, calculation, code, or reasoning Agent to "
+                    "discover an absent external fact; computational Agents may use "
+                    "only values present in the request or produced by dependencies. "
+                    "In particular, a country's population for a named year is an "
+                    "external fact when its numeric value is not supplied: create a "
+                    "search subtask for each required country before any arithmetic. "
+                    "Use exactly one "
                     "standalone marker of each kind, in this order: PLAN_JSON, "
                     "END_PLAN_JSON, PLANNING_REASONING, END_PLANNING_REASONING. "
                     "END_PLANNING_REASONING must be the final output line."
@@ -230,6 +287,7 @@ class LLaDAPlannerRuntime:
                 config=JsonAgentPriorityConfig(
                     catalog=request_agent_names,
                     priority_slots=self.config.agent_slots,
+                    tracking_slots=self.config.agent_timing_slots,
                     anchor_min_logit_margin=self.config.agent_anchor_margin,
                     tentative_probability=self.config.priority_threshold,
                     tentative_margin=self.config.priority_margin_threshold,
@@ -271,6 +329,18 @@ class LLaDAPlannerRuntime:
             suffix_ids[0, :visible_tokens], skip_special_tokens=True
         )
         content = self.apply_stop(content, request.stop).strip()
+        model_completion_tokens = len(
+            self.tokenizer(content, add_special_tokens=False).input_ids
+        )
+        repair_report = {
+            "applied": False,
+            "method": "disabled",
+            "operations": [],
+        }
+        if self.config.plan_json_repair and self.config.policy in {"mid", "now"}:
+            content, repair_report = repair_plan_json_response(
+                content, request_agent_names
+            )
         if controller is not None:
             controller.close()
         # OpenAI usage describes the text actually returned to the caller.  A
@@ -288,11 +358,14 @@ class LLaDAPlannerRuntime:
         }
         metrics = {
             "nfe": int(nfe),
-            "generated_tokens": int(completion_tokens),
+            "generated_tokens": int(model_completion_tokens),
+            "returned_tokens": int(completion_tokens),
+            "generation_seconds": generation_seconds,
             "tps": (
-                completion_tokens / generation_seconds
+                model_completion_tokens / generation_seconds
                 if generation_seconds > 0 else 0.0
             ),
+            "plan_json_repair": repair_report,
         }
         if controller is not None:
             metrics["agent_priority"] = controller.metrics()
@@ -410,9 +483,28 @@ async def chat_completions(payload: ChatCompletionRequest, request: Request):
         async with runtime.lock:
             content, usage, metrics = await asyncio.to_thread(runtime.generate, payload)
     except ValueError as error:
+        runtime.record_agent_timing(
+            completion_id=completion_id,
+            created=created,
+            request=payload,
+            error=str(error),
+        )
         raise HTTPException(status_code=400, detail=str(error)) from error
     except RuntimeError as error:
+        runtime.record_agent_timing(
+            completion_id=completion_id,
+            created=created,
+            request=payload,
+            error=str(error),
+        )
         raise HTTPException(status_code=500, detail=str(error)) from error
+
+    runtime.record_agent_timing(
+        completion_id=completion_id,
+        created=created,
+        request=payload,
+        metrics=metrics,
+    )
 
     if not payload.stream:
         return {
@@ -473,6 +565,15 @@ def parse_args():
     parser.add_argument("--steps_per_block", type=int, default=32)
     parser.add_argument("--agent_slots", type=int, default=4)
     parser.add_argument(
+        "--agent_timing_slots",
+        type=int,
+        default=32,
+        help=(
+            "Maximum normal-response Agent fields to time. Only agent_slots "
+            "fields participate in priority decoding or prefetch."
+        ),
+    )
+    parser.add_argument(
         "--agent_names",
         default=",".join(DEFAULT_AGENT_NAMES),
         help="Comma-separated agent registry in ID order.",
@@ -511,6 +612,30 @@ def parse_args():
         default="agent_decode.log",
         help="File for verbose Agent step/event logs (rotates at 20 MiB).",
     )
+    parser.add_argument(
+        "--agent_timing_log_path",
+        default="agent_timings.jsonl",
+        help=(
+            "Append-only JSONL file with one Agent timing record per API request."
+        ),
+    )
+    parser.add_argument(
+        "--agent_timing_summary_path",
+        default=None,
+        help=(
+            "Current server-session aggregate JSON. Defaults to "
+            "<agent_timing_log_path stem>.summary.json."
+        ),
+    )
+    parser.add_argument(
+        "--plan_json_repair",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Conservatively repair and validate the fixed planner JSON schema "
+            "before returning a response. Use --no-plan_json_repair to disable."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -528,6 +653,8 @@ def main():
         raise ValueError("max_gen_length must be divisible by block_size.")
     if args.agent_discovery_steps <= 0:
         raise ValueError("agent_discovery_steps must be positive.")
+    if args.agent_timing_slots < args.agent_slots:
+        raise ValueError("agent_timing_slots must be at least agent_slots.")
 
     runtime = LLaDAPlannerRuntime(
         ServerConfig(
@@ -538,6 +665,7 @@ def main():
             max_gen_length=args.max_gen_length,
             steps_per_block=args.steps_per_block,
             agent_slots=args.agent_slots,
+            agent_timing_slots=args.agent_timing_slots,
             agent_names=agent_names,
             cache_mode=args.cache_mode,
             threshold=args.threshold,
@@ -545,6 +673,9 @@ def main():
             priority_margin_threshold=args.priority_margin_threshold,
             agent_anchor_margin=args.agent_anchor_margin,
             agent_discovery_steps=args.agent_discovery_steps,
+            agent_timing_log_path=args.agent_timing_log_path,
+            agent_timing_summary_path=args.agent_timing_summary_path,
+            plan_json_repair=args.plan_json_repair,
             policy=args.policy,
             api_key=args.api_key,
         )

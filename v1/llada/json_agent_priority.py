@@ -51,6 +51,7 @@ def extract_agent_registry(
 class JsonAgentPriorityConfig:
     catalog: Sequence[str]
     priority_slots: int = 4
+    tracking_slots: Optional[int] = None
     anchor_min_logit_margin: float = -6.0
     anchor_stable_steps: int = 2
     tentative_probability: float = 0.45
@@ -67,6 +68,8 @@ class JsonAgentPriorityConfig:
             raise ValueError("Agent catalog must be non-empty and contain unique names.")
         if self.priority_slots < 1:
             raise ValueError("priority_slots must be positive.")
+        if self.tracking_slots is not None and self.tracking_slots < self.priority_slots:
+            raise ValueError("tracking_slots must be at least priority_slots.")
         if self.anchor_stable_steps < 1 or self.confirm_stable_steps < 1:
             raise ValueError("Stability step counts must be positive.")
         if self.discovery_steps < 1:
@@ -125,7 +128,8 @@ class JsonAgentFieldController:
         # phase can create self-fulfilling JSON anchors.  Reuse normal block
         # warm-ups for continuously improving anchor discovery instead.
         self.full_sequence_discovery_steps = 0
-        self.slots = [JsonAgentSlotRuntime() for _ in range(config.priority_slots)]
+        self.tracking_slots = config.tracking_slots or config.priority_slots
+        self.slots = [JsonAgentSlotRuntime() for _ in range(self.tracking_slots)]
         self._started_at: Optional[float] = None
         self._observed_steps = 0
         self._full_sequence_observations = 0
@@ -311,6 +315,25 @@ class JsonAgentFieldController:
                 continue
             selected.append(candidate)
             if len(selected) == self.config.priority_slots:
+                break
+
+        # Timing-only slots observe every later field that has already been
+        # materialized by the normal decoder. They never admit speculative
+        # anchors and therefore cannot affect the first-four prefetch policy.
+        tracked = {candidate[0]: candidate for candidate in selected}
+        for candidate in ranked:
+            if candidate[3] == 1.0:
+                tracked[candidate[0]] = candidate
+        selected = []
+        for candidate in sorted(tracked.values(), key=lambda item: item[0]):
+            position = candidate[0]
+            if any(
+                abs(position - existing[0]) < self.config.min_anchor_gap
+                for existing in selected
+            ):
+                continue
+            selected.append(candidate)
+            if len(selected) == self.tracking_slots:
                 break
         return selected
 
@@ -605,7 +628,10 @@ class JsonAgentFieldController:
                     slot_index,
                     distribution,
                     global_step,
-                    allow_write=(observed_name is None),
+                    allow_write=(
+                        slot_index < self.config.priority_slots
+                        and observed_name is None
+                    ),
                 )
 
     def decoder_mask(
@@ -629,18 +655,88 @@ class JsonAgentFieldController:
         # next block warm-up supplies another full-sequence observation.
         return False
 
+    def _materialized_anchor_candidates(
+        self, x: torch.Tensor
+    ) -> List[Tuple[int, Tuple[int, ...], float, float]]:
+        """Find natural JSON Agent anchors without consulting model logits."""
+
+        generation_start = self.prompt_length
+        generation_end = min(
+            x.shape[1], self.prompt_length + self.gen_length
+        )
+        sequence = x[0, generation_start:generation_end]
+        candidates: Dict[int, Tuple[int, Tuple[int, ...], float, float]] = {}
+        for pattern in self.anchor_variants:
+            width = len(pattern)
+            if sequence.shape[0] < width:
+                continue
+            target = torch.tensor(pattern, device=x.device, dtype=x.dtype)
+            windows = sequence.unfold(0, width, 1)
+            matches = torch.nonzero(
+                (windows == target).all(dim=1), as_tuple=False
+            ).flatten()
+            for relative_start in matches.detach().cpu().tolist():
+                absolute_start = generation_start + int(relative_start)
+                candidate = (absolute_start, pattern, 0.0, 1.0)
+                previous = candidates.get(absolute_start)
+                if previous is None or len(pattern) > len(previous[1]):
+                    candidates[absolute_start] = candidate
+
+        clustered = []
+        cluster_radius = max(len(pattern) for pattern in self.anchor_variants)
+        for candidate in sorted(candidates.values(), key=lambda item: item[0]):
+            if not clustered or candidate[0] - clustered[-1][-1][0] >= cluster_radius:
+                clustered.append([candidate])
+            else:
+                clustered[-1].append(candidate)
+        selected = [
+            max(cluster, key=lambda item: len(item[1]))
+            for cluster in clustered
+        ]
+        return selected[:self.tracking_slots]
+
     def finalize(self, x: torch.Tensor) -> None:
-        # An unrecognized field belongs to the ordinary decoder.  Forcing a
-        # low-confidence speculative candidate here would corrupt otherwise
-        # valid JSON at the end of generation.
-        del x
+        # Capture a field that materialized in the last generation block, where
+        # no subsequent full-sequence warm-up exists. Exact natural JSON is
+        # definitive evidence, so this records an end-of-generation upper bound
+        # without writing or otherwise changing the response canvas.
+        self._assign_anchors(x, self._materialized_anchor_candidates(x))
+        now = self._elapsed()
+        final_step = self._observed_steps
+        for runtime in self.slots:
+            observed_name = self._observed_catalog_value(x, runtime)
+            if observed_name is None:
+                continue
+            if runtime.first_observed_seconds is None:
+                runtime.first_observed_seconds = now
+                runtime.first_observed_step = final_step
+            runtime.candidate = observed_name
+            runtime.recognized_candidate = observed_name
+            runtime.candidate_probability = 1.0
+            runtime.candidate_margin = 1.0
+            runtime.recognized_probability = 1.0
+            runtime.recognized_margin = 1.0
+            if runtime.recognized_seconds is None:
+                runtime.recognized_seconds = now
+                runtime.recognized_step = final_step
+            if runtime.confirmed_seconds is None:
+                runtime.confirmed_seconds = now
+                runtime.confirmed_step = final_step
+            runtime.confirmed = True
 
     def metrics(self) -> Dict[str, object]:
         slots = []
         for index, runtime in enumerate(self.slots):
+            if (
+                index >= self.config.priority_slots
+                and runtime.anchor_start is None
+                and runtime.recognized_candidate is None
+            ):
+                continue
             slots.append(
                 {
                     "slot": index,
+                    "priority": index < self.config.priority_slots,
                     "agent": runtime.recognized_candidate,
                     "anchor_start": runtime.anchor_start,
                     "anchor_score": (
@@ -669,13 +765,26 @@ class JsonAgentFieldController:
         all_recognized = (
             discovered_count > 0 and recognized_count == discovered_count
         )
+        priority = slots[:self.config.priority_slots]
+        priority_discovered = sum(
+            slot["anchor_start"] is not None for slot in priority
+        )
+        priority_recognized = sum(
+            slot["recognized_seconds"] is not None for slot in priority
+        )
         return {
             "priority_slots": self.config.priority_slots,
+            "tracking_slots": self.tracking_slots,
+            "catalog": list(self.config.catalog),
             "observed_steps": self._observed_steps,
             "full_sequence_observations": self._full_sequence_observations,
             "discovered_agent_fields": discovered_count,
             "recognized_agent_fields": recognized_count,
-            "all_priority_agents_recognized": all_recognized,
+            "all_priority_agents_recognized": (
+                priority_discovered > 0
+                and priority_recognized == priority_discovered
+            ),
+            "all_tracked_agents_recognized": all_recognized,
             "agent_slots": slots,
             # Do not label a partial result as "all recognized".  Keep the
             # partial timestamp separately so failed runs remain diagnosable.

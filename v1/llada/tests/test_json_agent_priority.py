@@ -296,6 +296,53 @@ def test_natural_agent_name_typo_has_unique_fuzzy_registry_match():
     assert slot["fuzzy_matched_from"] == "serch_agent"
 
 
+def test_timing_only_slots_capture_agents_after_four_without_writing():
+    tokenizer = CharacterTokenizer()
+    controller = JsonAgentFieldController(
+        tokenizer=tokenizer,
+        config=JsonAgentPriorityConfig(
+            catalog=["code_agent", "math_agent", "search_agent", "commonsense_agent"],
+            priority_slots=4,
+            tracking_slots=8,
+        ),
+        prompt_length=8,
+        gen_length=360,
+        mask_id=tokenizer.mask_token_id,
+    )
+    x = torch.full((1, 368), tokenizer.mask_token_id, dtype=torch.long)
+    x[:, :8] = 1
+    controller.initialize(x)
+    anchor = controller.anchor_variants[0]
+    starts = [16, 66, 116, 166, 216, 266]
+    agents = [
+        "search_agent",
+        "search_agent",
+        "math_agent",
+        "math_agent",
+        "code_agent",
+        "commonsense_agent",
+    ]
+    for start, agent in zip(starts, agents):
+        x[0, start:start + len(anchor)] = torch.tensor(anchor)
+        value = controller.catalog_value_ids[agent]
+        name_start = start + len(anchor)
+        x[0, name_start:name_start + len(value)] = torch.tensor(value)
+
+    original = x.clone()
+    controller.finalize(x)
+    metrics = controller.metrics()
+    assert [slot["agent"] for slot in metrics["agent_slots"]] == agents
+    assert [slot["priority"] for slot in metrics["agent_slots"]] == [
+        True, True, True, True, False, False
+    ]
+    assert metrics["priority_slots"] == 4
+    assert metrics["tracking_slots"] == 8
+    assert metrics["recognized_agent_fields"] == 6
+    assert all(slot["confirmed"] for slot in metrics["agent_slots"])
+    assert all(not runtime.field_written for runtime in controller.slots)
+    assert torch.equal(x, original)
+
+
 class DiscoveryController:
     enabled = True
     full_sequence_discovery_steps = 3
