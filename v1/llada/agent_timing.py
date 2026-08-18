@@ -1,4 +1,4 @@
-"""Durable per-request Agent decision timing records for the LLaDA server."""
+"""Durable, retry-aware Agent decision timing records for the LLaDA server."""
 
 from __future__ import annotations
 
@@ -6,88 +6,42 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 LOGGER = logging.getLogger("fastdllm.agent_timing")
 
 
-class _RunningStats:
-    def __init__(self) -> None:
-        self.count = 0
-        self.total = 0.0
-        self.minimum: Optional[float] = None
-        self.maximum: Optional[float] = None
-
-    def add(self, value: Optional[float]) -> None:
-        if value is None:
-            return
-        number = float(value)
-        self.count += 1
-        self.total += number
-        self.minimum = number if self.minimum is None else min(self.minimum, number)
-        self.maximum = number if self.maximum is None else max(self.maximum, number)
-
-    def render(self) -> Dict[str, Optional[float]]:
-        return {
-            "count": self.count,
-            "sum_seconds": self.total,
-            "mean_seconds": (
-                self.total / self.count if self.count else None
-            ),
-            "min_seconds": self.minimum,
-            "max_seconds": self.maximum,
-        }
-
-
 class AgentTimingRecorder:
-    """Append one JSONL record per API request and maintain session aggregates."""
+    """Keep one latest JSONL record per stable model/query request identity.
 
-    schema_version = 1
+    ``request_index`` is only a stable display/order field. The upsert key is a
+    hash of ``model`` and ``query`` because the server-side index restarts when
+    the server restarts, while a resumed benchmark can skip successful cases.
+    """
 
-    def __init__(
-        self,
-        log_path: str,
-        summary_path: Optional[str] = None,
-    ) -> None:
+    schema_version = 2
+
+    def __init__(self, log_path: str) -> None:
         if not log_path:
             raise ValueError("Agent timing log path cannot be empty.")
         self.log_path = Path(log_path).expanduser().resolve()
-        self.summary_path = (
-            Path(summary_path).expanduser().resolve()
-            if summary_path
-            else self.log_path.with_suffix(".summary.json")
-        )
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        self.summary_path.parent.mkdir(parents=True, exist_ok=True)
-        # Fail at server startup, rather than halfway through a benchmark, if
-        # the configured record destination is not writable.
+        # Fail at server startup rather than halfway through a benchmark when
+        # the configured destination cannot be created.
         with self.log_path.open("a", encoding="utf-8"):
             pass
 
         self.session_id = f"agent-session-{uuid.uuid4().hex}"
         self.started_unix = time.time()
         self._lock = threading.Lock()
-        self._request_index = 0
-        self._requests_successful = 0
-        self._requests_failed = 0
-        self._requests_with_decisions = 0
-        self._requests_with_confirmations = 0
-        self._requests_repaired = 0
-        self._repair_failures = 0
-        self._agent_decisions = 0
-        self._agent_confirmations = 0
-        self._agent_unconfirmed = 0
-        self._decision_stats = _RunningStats()
-        self._confirmation_stats = _RunningStats()
-        self._all_decided_stats = _RunningStats()
-        self._all_confirmed_stats = _RunningStats()
-        self._generation_stats = _RunningStats()
-        self._write_summary()
+        self._migration_backup_path: Optional[str] = None
+        self._records = self._load_canonical_records()
 
     @staticmethod
     def _query_metadata(query: str) -> Dict[str, str]:
@@ -97,45 +51,120 @@ class AgentTimingRecorder:
             "query_sha256": hashlib.sha256(encoded).hexdigest(),
         }
 
-    def _summary(self) -> Dict[str, Any]:
-        return {
-            "schema_version": self.schema_version,
-            "session_id": self.session_id,
-            "session_started_unix": self.started_unix,
-            "updated_unix": time.time(),
-            "timing_log_path": str(self.log_path),
-            "requests": {
-                "total": self._request_index,
-                "successful": self._requests_successful,
-                "failed": self._requests_failed,
-                "with_agent_decisions": self._requests_with_decisions,
-                "with_agent_confirmations": self._requests_with_confirmations,
-                "plan_json_repaired": self._requests_repaired,
-                "plan_json_repair_failed": self._repair_failures,
-            },
-            "agents": {
-                "decided": self._agent_decisions,
-                "confirmed": self._agent_confirmations,
-                "decided_but_unconfirmed": self._agent_unconfirmed,
-            },
-            # Agent-level averages weight every (non-deduplicated) call equally.
-            "agent_decision_seconds": self._decision_stats.render(),
-            "agent_confirmation_seconds": self._confirmation_stats.render(),
-            # Request-level values are the time at which the last recorded
-            # Agent in that request was decided/confirmed.
-            "all_agents_decided_seconds_per_request": self._all_decided_stats.render(),
-            "all_agents_confirmed_seconds_per_request": self._all_confirmed_stats.render(),
-            "generation_seconds": self._generation_stats.render(),
-        }
+    @staticmethod
+    def _request_key(model: str, query: str) -> str:
+        identity = f"{model}\0{query}".encode("utf-8")
+        return hashlib.sha256(identity).hexdigest()
 
-    def _write_summary(self) -> None:
-        temporary = self.summary_path.with_suffix(
-            self.summary_path.suffix + ".tmp"
-        )
+    @classmethod
+    def _record_key(cls, record: Dict[str, Any]) -> str:
+        model = str(record.get("model") or "")
+        query = record.get("query")
+        if query is not None:
+            return cls._request_key(model, str(query))
+        # Legacy fallback only. New records always contain the original query.
+        query_hash = str(record.get("query_sha256") or "")
+        if not query_hash:
+            raise ValueError("Timing record has neither query nor query_sha256.")
+        return hashlib.sha256(
+            f"legacy\0{model}\0{query_hash}".encode("utf-8")
+        ).hexdigest()
+
+    def _read_records_from_disk(self) -> List[Dict[str, Any]]:
+        records: List[Dict[str, Any]] = []
+        with self.log_path.open("r", encoding="utf-8") as file:
+            for line_number, line in enumerate(file, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"Invalid timing JSONL at {self.log_path}:{line_number}: {exc}"
+                    ) from exc
+                if not isinstance(value, dict):
+                    raise ValueError(
+                        f"Timing JSONL record at {self.log_path}:{line_number} "
+                        "must be a JSON object."
+                    )
+                records.append(value)
+        return records
+
+    def _atomic_write_log(self, records: List[Dict[str, Any]]) -> None:
+        temporary = self.log_path.with_suffix(self.log_path.suffix + ".tmp")
         with temporary.open("w", encoding="utf-8") as file:
-            json.dump(self._summary(), file, ensure_ascii=False, indent=2)
-            file.write("\n")
-        os.replace(temporary, self.summary_path)
+            for record in records:
+                file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        os.replace(temporary, self.log_path)
+
+    def _backup_legacy_log(self) -> Path:
+        suffix = self.session_id.rsplit("-", 1)[-1][:12]
+        backup = self.log_path.with_name(
+            f"{self.log_path.name}.precanonical.{suffix}.bak"
+        )
+        shutil.copy2(self.log_path, backup)
+        self._migration_backup_path = str(backup)
+        return backup
+
+    def _load_canonical_records(self) -> Dict[str, Dict[str, Any]]:
+        raw_records = self._read_records_from_disk()
+        canonical: Dict[str, Dict[str, Any]] = {}
+        migration_needed = False
+
+        for raw in raw_records:
+            record = dict(raw)
+            key = self._record_key(record)
+            previous = canonical.get(key)
+            if previous is None:
+                attempt_count = max(1, int(record.get("attempt_count") or 1))
+                first_created = record.get("first_created_unix")
+                if first_created is None:
+                    first_created = record.get("created_unix")
+            else:
+                migration_needed = True
+                previous_attempts = max(
+                    1, int(previous.get("attempt_count") or 1)
+                )
+                attempt_count = max(
+                    previous_attempts + 1,
+                    int(record.get("attempt_count") or 1),
+                )
+                first_created = previous.get(
+                    "first_created_unix", previous.get("created_unix")
+                )
+
+            expected_index = (
+                int(previous["request_index"])
+                if previous is not None
+                else len(canonical) + 1
+            )
+            if (
+                record.get("schema_version") != self.schema_version
+                or record.get("request_key") != key
+                or record.get("request_index") != expected_index
+                or record.get("attempt_count") != attempt_count
+                or record.get("first_created_unix") != first_created
+            ):
+                migration_needed = True
+
+            record["schema_version"] = self.schema_version
+            record["request_key"] = key
+            record["request_index"] = expected_index
+            record["attempt_count"] = attempt_count
+            record["first_created_unix"] = first_created
+            canonical[key] = record
+
+        if migration_needed and raw_records:
+            backup = self._backup_legacy_log()
+            self._atomic_write_log(list(canonical.values()))
+            LOGGER.info(
+                "agent_timing_migrated input_records=%d canonical_records=%d "
+                "backup=%s",
+                len(raw_records),
+                len(canonical),
+                backup,
+            )
+        return canonical
 
     def record(
         self,
@@ -163,11 +192,7 @@ class AgentTimingRecorder:
                     "slot": slot.get("slot"),
                     "agent": name,
                     "priority": bool(slot.get("priority")),
-                    # Decision is when the name first satisfies the configured
-                    # probability/margin gates and can trigger prefetch.
                     "decision_seconds": decision,
-                    # Confirmation additionally requires a naturally emitted
-                    # JSON anchor and is the stricter post-verification time.
                     "confirmation_seconds": confirmation,
                     "decision_step": slot.get("recognized_step"),
                     "confirmation_step": slot.get("confirmed_step"),
@@ -191,10 +216,14 @@ class AgentTimingRecorder:
         all_decided = max(decisions) if decisions else None
         all_confirmed = max(confirmations) if confirmations else None
         repair = metrics.get("plan_json_repair") or None
+        request_key = self._request_key(model, query)
         record = {
             "schema_version": self.schema_version,
             "session_id": self.session_id,
+            "request_key": request_key,
             "request_index": None,
+            "attempt_count": None,
+            "first_created_unix": None,
             "completion_id": completion_id,
             "created_unix": int(created_unix),
             **self._query_metadata(query),
@@ -220,43 +249,28 @@ class AgentTimingRecorder:
         }
 
         with self._lock:
-            self._request_index += 1
-            record["request_index"] = self._request_index
-            if error:
-                self._requests_failed += 1
+            previous = self._records.get(request_key)
+            if previous is None:
+                record["request_index"] = len(self._records) + 1
+                record["attempt_count"] = 1
+                record["first_created_unix"] = int(created_unix)
             else:
-                self._requests_successful += 1
-            if decisions:
-                self._requests_with_decisions += 1
-            if confirmations:
-                self._requests_with_confirmations += 1
-            if repair and repair.get("applied"):
-                self._requests_repaired += 1
-            if repair and repair.get("method") == "failed":
-                self._repair_failures += 1
-            self._agent_decisions += len(decisions)
-            self._agent_confirmations += len(confirmations)
-            self._agent_unconfirmed += sum(
-                item["decision_seconds"] is not None
-                and item["confirmation_seconds"] is None
-                for item in agents
-            )
-            for value in decisions:
-                self._decision_stats.add(value)
-            for value in confirmations:
-                self._confirmation_stats.add(value)
-            self._all_decided_stats.add(all_decided)
-            self._all_confirmed_stats.add(all_confirmed)
-            self._generation_stats.add(metrics.get("generation_seconds"))
-
-            with self.log_path.open("a", encoding="utf-8") as file:
-                file.write(json.dumps(record, ensure_ascii=False) + "\n")
-            self._write_summary()
+                record["request_index"] = previous["request_index"]
+                record["attempt_count"] = max(
+                    1, int(previous.get("attempt_count") or 1)
+                ) + 1
+                record["first_created_unix"] = previous.get(
+                    "first_created_unix", previous.get("created_unix")
+                )
+            self._records[request_key] = record
+            self._atomic_write_log(list(self._records.values()))
 
         LOGGER.info(
-            "agent_timing_saved request=%s decisions=%d confirmations=%d "
-            "all_decided_seconds=%s",
+            "agent_timing_saved request=%s attempt=%s updated=%s "
+            "decisions=%d confirmations=%d all_decided_seconds=%s",
             record["request_index"],
+            record["attempt_count"],
+            previous is not None,
             len(decisions),
             len(confirmations),
             all_decided,

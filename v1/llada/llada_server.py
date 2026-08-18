@@ -87,7 +87,6 @@ class ServerConfig:
     agent_anchor_margin: float
     agent_discovery_steps: int
     agent_timing_log_path: str
-    agent_timing_summary_path: Optional[str]
     plan_json_repair: bool
     policy: str
     api_key: Optional[str]
@@ -100,10 +99,7 @@ class LLaDAPlannerRuntime:
         self.tokenizer = None
         self.model = None
         self.lock = None
-        self.timing_recorder = AgentTimingRecorder(
-            config.agent_timing_log_path,
-            config.agent_timing_summary_path,
-        )
+        self.timing_recorder = AgentTimingRecorder(config.agent_timing_log_path)
 
     def load(self):
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -616,15 +612,7 @@ def parse_args():
         "--agent_timing_log_path",
         default="agent_timings.jsonl",
         help=(
-            "Append-only JSONL file with one Agent timing record per API request."
-        ),
-    )
-    parser.add_argument(
-        "--agent_timing_summary_path",
-        default=None,
-        help=(
-            "Current server-session aggregate JSON. Defaults to "
-            "<agent_timing_log_path stem>.summary.json."
+            "Canonical JSONL file with the latest Agent timing record per request."
         ),
     )
     parser.add_argument(
@@ -674,7 +662,6 @@ def main():
             agent_anchor_margin=args.agent_anchor_margin,
             agent_discovery_steps=args.agent_discovery_steps,
             agent_timing_log_path=args.agent_timing_log_path,
-            agent_timing_summary_path=args.agent_timing_summary_path,
             plan_json_repair=args.plan_json_repair,
             policy=args.policy,
             api_key=args.api_key,

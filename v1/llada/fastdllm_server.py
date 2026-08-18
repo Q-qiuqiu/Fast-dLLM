@@ -6,6 +6,7 @@ autoregressive tokens, so this server intentionally rejects ``stream=true``.
 
 import argparse
 import asyncio
+import logging
 import math
 import os
 import time
@@ -37,6 +38,7 @@ DEVICE = os.getenv("FASTDLLM_DEVICE", "cuda")
 DTYPE = os.getenv("FASTDLLM_DTYPE", "bfloat16")
 API_KEY = os.getenv("FASTDLLM_API_KEY")
 LOG_LEVEL = os.getenv("FASTDLLM_LOG_LEVEL", "info")
+LOGGER = logging.getLogger("uvicorn.error")
 
 
 class TextContentPart(BaseModel):
@@ -81,6 +83,7 @@ class ServerConfig:
     gen_length: int
     steps: int
     threshold: Optional[float]
+    debug: bool
     api_key: Optional[str]
 
 
@@ -112,6 +115,25 @@ class LLaDARuntime:
             torch_dtype=self._torch_dtype(),
         ).to(self.device).eval()
         self.lock = asyncio.Lock()
+
+    def cuda_memory_snapshot(self) -> str:
+        """Return a compact best-effort CUDA memory snapshot for diagnostics."""
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            return "cuda=unavailable"
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
+            allocated_bytes = torch.cuda.memory_allocated(self.device)
+            reserved_bytes = torch.cuda.memory_reserved(self.device)
+            mib = 1024 * 1024
+            return (
+                f"free_mib={free_bytes / mib:.1f} "
+                f"total_mib={total_bytes / mib:.1f} "
+                f"allocated_mib={allocated_bytes / mib:.1f} "
+                f"reserved_mib={reserved_bytes / mib:.1f}"
+            )
+        except Exception as exc:
+            # Memory inspection must never hide the original inference error.
+            return f"cuda_memory_unavailable={type(exc).__name__}:{exc}"
 
     @staticmethod
     def _content_to_text(message: ChatMessage) -> str:
@@ -164,7 +186,11 @@ class LLaDARuntime:
             return text, False
         return text[:min(positions)], True
 
-    def generate(self, request: ChatCompletionRequest):
+    def generate(
+        self,
+        request: ChatCompletionRequest,
+        request_id: Optional[str] = None,
+    ):
         if request.model != self.config.served_model_name:
             raise ValueError(
                 f"Model {request.model!r} is not served. Use "
@@ -187,6 +213,42 @@ class LLaDARuntime:
             rendered_prompt,
             return_tensors="pt",
         ).input_ids.to(self.device)
+        prompt_tokens = int(input_ids.shape[1])
+        total_sequence_tokens = prompt_tokens + gen_length
+        model_max_sequence = getattr(
+            getattr(self.model, "config", None),
+            "max_sequence_length",
+            None,
+        )
+        if self.config.debug:
+            LOGGER.info(
+                "inference_prepared request_id=%s prompt_tokens=%d "
+                "visible_tokens=%d generation_slots=%d total_sequence_tokens=%d "
+                "model_max_sequence=%s steps=%d blocks=%d steps_per_block=%d "
+                "cache_mode=%s threshold=%s temperature=%s cuda_memory={%s}",
+                request_id,
+                prompt_tokens,
+                visible_tokens,
+                gen_length,
+                total_sequence_tokens,
+                model_max_sequence,
+                steps,
+                gen_length // self.config.block_size,
+                steps // (gen_length // self.config.block_size),
+                self.config.cache_mode,
+                self.config.threshold,
+                request.temperature,
+                self.cuda_memory_snapshot(),
+            )
+            if model_max_sequence and total_sequence_tokens > model_max_sequence:
+                LOGGER.warning(
+                    "inference_sequence_over_config request_id=%s "
+                    "total_sequence_tokens=%d model_max_sequence=%d over_by=%d",
+                    request_id,
+                    total_sequence_tokens,
+                    model_max_sequence,
+                    total_sequence_tokens - model_max_sequence,
+                )
 
         if request.seed is not None:
             torch.manual_seed(request.seed)
@@ -218,7 +280,23 @@ class LLaDARuntime:
 
         suffix_ids = output_ids[0, input_ids.shape[1]:input_ids.shape[1] + visible_tokens]
         token_ids = suffix_ids.tolist()
-        if mask_id in token_ids:
+        unresolved_masks = token_ids.count(mask_id)
+        if unresolved_masks:
+            if self.config.debug:
+                LOGGER.error(
+                    "inference_unresolved_masks request_id=%s unresolved_masks=%d "
+                    "visible_tokens=%d nfe=%d generation_seconds=%.6f",
+                    request_id,
+                    unresolved_masks,
+                    visible_tokens,
+                    int(nfe),
+                    elapsed,
+                )
+                raise RuntimeError(
+                    f"Generation ended with {unresolved_masks} unresolved mask "
+                    "tokens. Check the gen-length, block-size, cache-mode, "
+                    "threshold, and steps combination."
+                )
             raise RuntimeError(
                 "Generation ended with unresolved mask tokens. Check the "
                 "gen-length, block-size, and cache-mode combination."
@@ -238,7 +316,6 @@ class LLaDARuntime:
         completion_tokens = len(
             self.tokenizer(content, add_special_tokens=False).input_ids
         )
-        prompt_tokens = int(input_ids.shape[1])
         usage = {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -276,7 +353,37 @@ def get_runtime() -> LLaDARuntime:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     current_runtime = get_runtime()
-    current_runtime.load()
+    if current_runtime.config.debug:
+        LOGGER.info(
+            "model_loading model=%s device=%s dtype=%s",
+            current_runtime.config.model_path,
+            current_runtime.config.device,
+            current_runtime.config.dtype,
+        )
+    started_at = time.perf_counter()
+    try:
+        current_runtime.load()
+    except Exception:
+        if current_runtime.config.debug:
+            LOGGER.exception(
+                "model_load_failed model=%s device=%s",
+                current_runtime.config.model_path,
+                current_runtime.config.device,
+            )
+        raise
+    if current_runtime.config.debug:
+        LOGGER.info(
+            "model_ready model=%s load_seconds=%.3f cache_mode=%s "
+            "gen_length=%d block_size=%d steps=%d threshold=%s cuda_memory={%s}",
+            current_runtime.config.model_path,
+            time.perf_counter() - started_at,
+            current_runtime.config.cache_mode,
+            current_runtime.config.gen_length,
+            current_runtime.config.block_size,
+            current_runtime.config.steps,
+            current_runtime.config.threshold,
+            current_runtime.cuda_memory_snapshot(),
+        )
     yield
 
 
@@ -372,19 +479,114 @@ async def chat_completions(payload: ChatCompletionRequest, request: Request):
     if current_runtime.lock is None:
         raise HTTPException(status_code=503, detail="Model is not ready.")
 
+    debug = current_runtime.config.debug
+    request_id = f"req-{uuid.uuid4().hex[:16]}" if debug else None
+    request_started_at = time.perf_counter()
+    if debug:
+        message_chars = sum(
+            len(current_runtime._content_to_text(message))
+            for message in payload.messages
+        )
+        LOGGER.info(
+            "inference_received request_id=%s client=%s model=%s messages=%d "
+            "message_chars=%d requested_max_tokens=%s temperature=%s",
+            request_id,
+            request.client.host if request.client else None,
+            payload.model,
+            len(payload.messages),
+            message_chars,
+            payload.max_completion_tokens or payload.max_tokens,
+            payload.temperature,
+        )
     try:
         async with current_runtime.lock:
+            if debug:
+                queue_seconds = time.perf_counter() - request_started_at
+                LOGGER.info(
+                    "inference_started request_id=%s queue_seconds=%.6f "
+                    "cuda_memory={%s}",
+                    request_id,
+                    queue_seconds,
+                    current_runtime.cuda_memory_snapshot(),
+                )
             content, finish_reason, usage, metrics = await asyncio.to_thread(
                 current_runtime.generate,
                 payload,
+                request_id,
             )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if debug:
+            LOGGER.warning(
+                "inference_rejected request_id=%s elapsed_seconds=%.6f "
+                "error_type=%s error=%s",
+                request_id,
+                time.perf_counter() - request_started_at,
+                type(exc).__name__,
+                exc,
+            )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"request_id={request_id} {type(exc).__name__}: {exc}"
+                if debug
+                else str(exc)
+            ),
+        ) from exc
     except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        if debug:
+            LOGGER.exception(
+                "inference_failed request_id=%s elapsed_seconds=%.6f "
+                "error_type=%s error=%s cuda_memory={%s}",
+                request_id,
+                time.perf_counter() - request_started_at,
+                type(exc).__name__,
+                exc,
+                current_runtime.cuda_memory_snapshot(),
+            )
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"request_id={request_id} {type(exc).__name__}: {exc}"
+                if debug
+                else str(exc)
+            ),
+        ) from exc
+    except Exception as exc:
+        if not debug:
+            raise
+        LOGGER.exception(
+            "inference_failed request_id=%s elapsed_seconds=%.6f "
+            "error_type=%s error=%s cuda_memory={%s}",
+            request_id,
+            time.perf_counter() - request_started_at,
+            type(exc).__name__,
+            exc,
+            current_runtime.cuda_memory_snapshot(),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"request_id={request_id} {type(exc).__name__}: {exc}",
+        ) from exc
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
+    if debug:
+        LOGGER.info(
+            "inference_completed request_id=%s elapsed_seconds=%.6f "
+            "generation_seconds=%.6f prompt_tokens=%d completion_tokens=%d "
+            "nfe=%d finish_reason=%s slot_tps=%.6f useful_tps=%.6f "
+            "cuda_memory={%s}",
+            request_id,
+            time.perf_counter() - request_started_at,
+            metrics["generation_time"],
+            usage["prompt_tokens"],
+            usage["completion_tokens"],
+            metrics["nfe"],
+            finish_reason,
+            metrics["slot_tps"],
+            metrics["useful_tps"],
+            current_runtime.cuda_memory_snapshot(),
+        )
     return {
         "id": completion_id,
         "object": "chat.completion",
@@ -439,6 +641,14 @@ def parse_args() -> argparse.Namespace:
             "restore quota-based token transfer."
         ),
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "Print per-request token lengths, decode configuration, CUDA memory, "
+            "timings, and full inference exception tracebacks."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -476,6 +686,7 @@ def main() -> None:
             gen_length=args.gen_length,
             steps=args.steps,
             threshold=args.threshold,
+            debug=args.debug,
             api_key=API_KEY,
         )
     )

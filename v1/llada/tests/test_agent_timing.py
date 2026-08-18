@@ -1,11 +1,21 @@
 import json
 
-import pytest
-
 from agent_timing import AgentTimingRecorder
 
 
-def test_records_every_request_and_updates_current_session_summary(tmp_path):
+def _record(recorder, completion_id, created_unix, query, **kwargs):
+    return recorder.record(
+        completion_id=completion_id,
+        created_unix=created_unix,
+        query=query,
+        model="llada",
+        temperature=0.0,
+        requested_max_tokens=1024,
+        **kwargs,
+    )
+
+
+def test_records_requests_in_canonical_log_without_writing_summary(tmp_path):
     log_path = tmp_path / "agent_timings.jsonl"
     recorder = AgentTimingRecorder(str(log_path))
     metrics = {
@@ -53,22 +63,12 @@ def test_records_every_request_and_updates_current_session_summary(tmp_path):
             ],
         },
     }
-    first = recorder.record(
-        completion_id="chatcmpl-ok",
-        created_unix=100,
-        query="question one",
-        model="llada",
-        temperature=0.0,
-        requested_max_tokens=1024,
-        metrics=metrics,
-    )
-    recorder.record(
-        completion_id="chatcmpl-error",
-        created_unix=101,
-        query="question two",
-        model="llada",
-        temperature=0.0,
-        requested_max_tokens=1024,
+    first = _record(recorder, "chatcmpl-ok", 100, "question one", metrics=metrics)
+    _record(
+        recorder,
+        "chatcmpl-error",
+        101,
+        "question two",
         error="generation failed",
     )
 
@@ -76,6 +76,7 @@ def test_records_every_request_and_updates_current_session_summary(tmp_path):
     assert len(records) == 2
     assert records[0] == first
     assert records[0]["request_index"] == 1
+    assert records[0]["attempt_count"] == 1
     assert records[0]["agent_decision_count"] == 2
     assert records[0]["agent_confirmation_count"] == 1
     assert records[0]["priority_slots"] == 4
@@ -85,55 +86,99 @@ def test_records_every_request_and_updates_current_session_summary(tmp_path):
     assert records[0]["all_agents_confirmed_seconds"] == 1.5
     assert records[1]["request_index"] == 2
     assert records[1]["status"] == "error"
-    assert records[0]["session_id"] == records[1]["session_id"]
 
-    summary_path = tmp_path / "agent_timings.summary.json"
-    summary = json.loads(summary_path.read_text())
-    assert summary["session_id"] == recorder.session_id
-    assert summary["requests"] == {
-        "total": 2,
-        "successful": 1,
-        "failed": 1,
-        "with_agent_decisions": 1,
-        "with_agent_confirmations": 1,
-        "plan_json_repaired": 1,
-        "plan_json_repair_failed": 0,
-    }
-    assert summary["agents"] == {
-        "decided": 2,
-        "confirmed": 1,
-        "decided_but_unconfirmed": 1,
-    }
-    assert summary["agent_decision_seconds"]["mean_seconds"] == pytest.approx(2.0)
-    assert summary["agent_confirmation_seconds"]["mean_seconds"] == pytest.approx(1.5)
-    assert summary["all_agents_decided_seconds_per_request"]["mean_seconds"] == 3.0
-    assert summary["generation_seconds"]["mean_seconds"] == 10.0
+    assert not (tmp_path / "agent_timings.summary.json").exists()
 
 
-def test_new_server_session_appends_jsonl_but_restarts_summary(tmp_path):
+def test_restart_retry_upserts_by_model_and_query_not_request_index(tmp_path):
     log_path = tmp_path / "timings.jsonl"
     first = AgentTimingRecorder(str(log_path))
-    first.record(
-        completion_id="one",
-        created_unix=1,
-        query="one",
-        model="llada",
-        temperature=0.0,
-        requested_max_tokens=None,
-    )
+    _record(first, "one-error", 1, "query one", error="first attempt failed")
+    _record(first, "two-ok", 2, "query two")
+
     second = AgentTimingRecorder(str(log_path))
-    second.record(
-        completion_id="two",
-        created_unix=2,
-        query="two",
-        model="llada",
-        temperature=0.0,
-        requested_max_tokens=None,
+    retried = _record(second, "one-ok", 3, "query one")
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+
+    assert len(records) == 2
+    assert retried["request_index"] == 1
+    assert retried["attempt_count"] == 2
+    assert retried["first_created_unix"] == 1
+    assert records[0]["completion_id"] == "one-ok"
+    assert records[0]["status"] == "ok"
+    assert records[1]["completion_id"] == "two-ok"
+    assert records[0]["session_id"] == second.session_id
+    assert records[1]["session_id"] == first.session_id
+
+    assert not (tmp_path / "timings.summary.json").exists()
+
+
+def test_legacy_append_log_is_backed_up_deduplicated_and_reindexed(tmp_path):
+    log_path = tmp_path / "legacy.jsonl"
+    legacy = [
+        {
+            "schema_version": 1,
+            "session_id": "old-a",
+            "request_index": 1,
+            "completion_id": "a-error",
+            "created_unix": 10,
+            "query": "query a",
+            "model": "llada",
+            "status": "error",
+            "agents": [],
+        },
+        {
+            "schema_version": 1,
+            "session_id": "old-a",
+            "request_index": 2,
+            "completion_id": "b-ok",
+            "created_unix": 11,
+            "query": "query b",
+            "model": "llada",
+            "status": "ok",
+            "agents": [],
+        },
+        {
+            "schema_version": 1,
+            "session_id": "old-b",
+            "request_index": 1,
+            "completion_id": "a-ok",
+            "created_unix": 12,
+            "query": "query a",
+            "model": "llada",
+            "status": "ok",
+            "agents": [],
+        },
+        {
+            "schema_version": 1,
+            "session_id": "old-b",
+            "request_index": 2,
+            "completion_id": "c-ok",
+            "created_unix": 13,
+            "query": "query c",
+            "model": "llada",
+            "status": "ok",
+            "agents": [],
+        },
+    ]
+    log_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in legacy),
+        encoding="utf-8",
     )
 
+    recorder = AgentTimingRecorder(str(log_path))
     records = [json.loads(line) for line in log_path.read_text().splitlines()]
-    assert len(records) == 2
-    assert records[0]["session_id"] != records[1]["session_id"]
-    summary = json.loads((tmp_path / "timings.summary.json").read_text())
-    assert summary["session_id"] == second.session_id
-    assert summary["requests"]["total"] == 1
+    assert [record["completion_id"] for record in records] == [
+        "a-ok",
+        "b-ok",
+        "c-ok",
+    ]
+    assert [record["request_index"] for record in records] == [1, 2, 3]
+    assert records[0]["attempt_count"] == 2
+    assert records[0]["first_created_unix"] == 10
+    assert records[0]["status"] == "ok"
+
+    backups = list(tmp_path.glob("legacy.jsonl.precanonical.*.bak"))
+    assert len(backups) == 1
+    assert len(backups[0].read_text().splitlines()) == 4
+    assert recorder._migration_backup_path == str(backups[0])
