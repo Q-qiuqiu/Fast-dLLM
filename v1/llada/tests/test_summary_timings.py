@@ -94,6 +94,69 @@ def test_deduplicates_legacy_retries_using_latest_model_query_record():
     assert summary["agent_decision_seconds"]["mean_seconds"] == 2.0
 
 
+def test_does_not_merge_same_query_from_different_policies():
+    planreason = _timing_record("same query")
+    planreason["policy"] = "planreason"
+    reasonplan = _timing_record("same query")
+    reasonplan["policy"] = "reasonplan"
+
+    summary = summarize_records([planreason, reasonplan])
+
+    assert summary["requests"]["total"] == 2
+    assert summary["requests"]["updated_records"] == 0
+
+
+def test_priority_completion_uses_only_prefetch_slots_not_all_timing_slots():
+    record = _timing_record("many agents")
+    record["priority_slots"] = 3
+    record["all_priority_agents_recognized"] = True
+    record["agents"] = [
+        {
+            "slot": 0,
+            "priority": True,
+            "decision_seconds": 1.0,
+            "confirmation_seconds": 1.2,
+        },
+        {
+            "slot": 1,
+            "priority": True,
+            "decision_seconds": 3.0,
+            "confirmation_seconds": 3.2,
+        },
+        {
+            "slot": 2,
+            "priority": True,
+            "decision_seconds": 2.0,
+            "confirmation_seconds": 2.2,
+        },
+        {
+            "slot": 3,
+            "priority": False,
+            "decision_seconds": 10.0,
+            "confirmation_seconds": 11.0,
+        },
+    ]
+    record["all_agents_decided_seconds"] = 10.0
+    record["all_agents_confirmed_seconds"] = 11.0
+
+    summary = summarize_records([record])
+
+    assert (
+        summary["all_priority_agents_decided_seconds_per_request"][
+            "mean_seconds"
+        ]
+        == 3.0
+    )
+    assert (
+        summary["all_priority_agents_confirmed_seconds_per_request"][
+            "mean_seconds"
+        ]
+        == 3.2
+    )
+    assert summary["all_agents_decided_seconds_per_request"]["mean_seconds"] == 10.0
+    assert summary["all_agents_confirmed_seconds_per_request"]["mean_seconds"] == 11.0
+
+
 def test_writes_summary_to_requested_path(tmp_path):
     input_path = tmp_path / "huskyqa_timings.jsonl"
     output_path = tmp_path / "huskyqa_timings_summary.json"

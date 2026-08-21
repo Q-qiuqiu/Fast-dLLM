@@ -39,6 +39,8 @@ def _derived_request_key(record: Dict[str, Any]) -> str:
     query = record.get("query")
     if query is not None:
         identity = f"{model}\0{query}"
+        if record.get("policy"):
+            identity += f"\0policy={record['policy']}"
     else:
         query_hash = record.get("query_sha256")
         if not query_hash:
@@ -91,6 +93,10 @@ def summarize_records(
     canonical = canonical_latest(records)
     decision_stats = _NumericStats()
     confirmation_stats = _NumericStats()
+    priority_decision_stats = _NumericStats()
+    priority_confirmation_stats = _NumericStats()
+    all_priority_decided_stats = _NumericStats()
+    all_priority_confirmed_stats = _NumericStats()
     all_decided_stats = _NumericStats()
     all_confirmed_stats = _NumericStats()
     generation_stats = _NumericStats()
@@ -103,6 +109,8 @@ def summarize_records(
     failed = 0
     with_decisions = 0
     with_confirmations = 0
+    with_all_priority_decisions = 0
+    with_all_priority_confirmations = 0
     repaired = 0
     repair_failures = 0
     agent_decisions = 0
@@ -125,6 +133,17 @@ def summarize_records(
             for item in agents
             if item.get("confirmation_seconds") is not None
         ]
+        priority_agents = [item for item in agents if item.get("priority")]
+        priority_decisions = [
+            float(item["decision_seconds"])
+            for item in priority_agents
+            if item.get("decision_seconds") is not None
+        ]
+        priority_confirmations = [
+            float(item["confirmation_seconds"])
+            for item in priority_agents
+            if item.get("confirmation_seconds") is not None
+        ]
         if decisions:
             with_decisions += 1
         if confirmations:
@@ -140,6 +159,30 @@ def summarize_records(
             decision_stats.add(value)
         for value in confirmations:
             confirmation_stats.add(value)
+        for value in priority_decisions:
+            priority_decision_stats.add(value)
+        for value in priority_confirmations:
+            priority_confirmation_stats.add(value)
+
+        # New timing records carry an explicit completeness flag. Legacy logs
+        # do not, so retain their best available first-N measurement rather
+        # than discarding all historical data.
+        priority_decisions_complete = record.get(
+            "all_priority_agents_recognized"
+        )
+        if priority_decisions_complete is None:
+            priority_decisions_complete = bool(priority_decisions)
+        priority_confirmations_complete = (
+            bool(priority_decisions_complete)
+            and bool(priority_agents)
+            and len(priority_confirmations) == len(priority_agents)
+        )
+        if priority_decisions_complete and priority_decisions:
+            all_priority_decided_stats.add(max(priority_decisions))
+            with_all_priority_decisions += 1
+        if priority_confirmations_complete and priority_confirmations:
+            all_priority_confirmed_stats.add(max(priority_confirmations))
+            with_all_priority_confirmations += 1
         all_decided_stats.add(record.get("all_agents_decided_seconds"))
         all_confirmed_stats.add(record.get("all_agents_confirmed_seconds"))
         generation_stats.add(record.get("generation_seconds"))
@@ -175,6 +218,10 @@ def summarize_records(
             "failed": failed,
             "with_agent_decisions": with_decisions,
             "with_agent_confirmations": with_confirmations,
+            "with_all_priority_agent_decisions": with_all_priority_decisions,
+            "with_all_priority_agent_confirmations": (
+                with_all_priority_confirmations
+            ),
             "plan_json_repaired": repaired,
             "plan_json_repair_failed": repair_failures,
             "updated_records": sum(count > 1 for count in attempt_counts),
@@ -187,6 +234,22 @@ def summarize_records(
         },
         "agent_decision_seconds": decision_stats.render("seconds"),
         "agent_confirmation_seconds": confirmation_stats.render("seconds"),
+        # Agent-level values across only the prefetch-enabled first
+        # ``agent_slots`` occurrences (items whose timing record says priority).
+        "priority_agent_decision_seconds": priority_decision_stats.render(
+            "seconds"
+        ),
+        "priority_agent_confirmation_seconds": (
+            priority_confirmation_stats.render("seconds")
+        ),
+        # This is the requested prefetch-ready metric: for each request, take
+        # the last decision/confirmation among only its priority Agent slots.
+        "all_priority_agents_decided_seconds_per_request": (
+            all_priority_decided_stats.render("seconds")
+        ),
+        "all_priority_agents_confirmed_seconds_per_request": (
+            all_priority_confirmed_stats.render("seconds")
+        ),
         "all_agents_decided_seconds_per_request": all_decided_stats.render(
             "seconds"
         ),

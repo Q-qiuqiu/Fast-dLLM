@@ -21,8 +21,10 @@ class AgentTimingRecorder:
     """Keep one latest JSONL record per stable model/query request identity.
 
     ``request_index`` is only a stable display/order field. The upsert key is a
-    hash of ``model`` and ``query`` because the server-side index restarts when
-    the server restarts, while a resumed benchmark can skip successful cases.
+    hash of ``model``, ``query``, and (when present) decoding ``policy`` because
+    the server-side index restarts when the server restarts, while a resumed
+    benchmark can skip successful cases. Including policy keeps planreason and
+    reasonplan comparison runs from overwriting one another.
     """
 
     schema_version = 2
@@ -52,8 +54,13 @@ class AgentTimingRecorder:
         }
 
     @staticmethod
-    def _request_key(model: str, query: str) -> str:
-        identity = f"{model}\0{query}".encode("utf-8")
+    def _request_key(
+        model: str, query: str, policy: Optional[str] = None
+    ) -> str:
+        identity_text = f"{model}\0{query}"
+        if policy:
+            identity_text += f"\0policy={policy}"
+        identity = identity_text.encode("utf-8")
         return hashlib.sha256(identity).hexdigest()
 
     @classmethod
@@ -61,7 +68,11 @@ class AgentTimingRecorder:
         model = str(record.get("model") or "")
         query = record.get("query")
         if query is not None:
-            return cls._request_key(model, str(query))
+            return cls._request_key(
+                model,
+                str(query),
+                record.get("policy"),
+            )
         # Legacy fallback only. New records always contain the original query.
         query_hash = str(record.get("query_sha256") or "")
         if not query_hash:
@@ -216,7 +227,8 @@ class AgentTimingRecorder:
         all_decided = max(decisions) if decisions else None
         all_confirmed = max(confirmations) if confirmations else None
         repair = metrics.get("plan_json_repair") or None
-        request_key = self._request_key(model, query)
+        policy = priority.get("policy")
+        request_key = self._request_key(model, query, policy)
         record = {
             "schema_version": self.schema_version,
             "session_id": self.session_id,
@@ -233,8 +245,15 @@ class AgentTimingRecorder:
             "status": "error" if error else "ok",
             "error": error,
             "agent_registry": priority.get("catalog"),
+            "policy": policy,
             "priority_slots": priority.get("priority_slots"),
             "tracking_slots": priority.get("tracking_slots"),
+            "all_priority_agents_recognized": priority.get(
+                "all_priority_agents_recognized"
+            ),
+            "all_tracked_agents_recognized": priority.get(
+                "all_tracked_agents_recognized"
+            ),
             "agents": agents,
             "agent_decision_count": len(decisions),
             "agent_confirmation_count": len(confirmations),

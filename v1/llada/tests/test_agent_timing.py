@@ -113,6 +113,34 @@ def test_restart_retry_upserts_by_model_and_query_not_request_index(tmp_path):
     assert not (tmp_path / "timings.summary.json").exists()
 
 
+def test_same_query_under_different_policies_keeps_both_records(tmp_path):
+    log_path = tmp_path / "policy_timings.jsonl"
+    recorder = AgentTimingRecorder(str(log_path))
+    _record(
+        recorder,
+        "planreason",
+        1,
+        "same query",
+        metrics={"agent_priority": {"policy": "planreason"}},
+    )
+    _record(
+        recorder,
+        "reasonplan",
+        2,
+        "same query",
+        metrics={"agent_priority": {"policy": "reasonplan"}},
+    )
+
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert len(records) == 2
+    assert [record["policy"] for record in records] == [
+        "planreason",
+        "reasonplan",
+    ]
+    assert records[0]["request_key"] != records[1]["request_key"]
+    assert [record["request_index"] for record in records] == [1, 2]
+
+
 def test_legacy_append_log_is_backed_up_deduplicated_and_reindexed(tmp_path):
     log_path = tmp_path / "legacy.jsonl"
     legacy = [

@@ -27,19 +27,24 @@ MAX_AGENT_SLOTS = 4
 
 
 def configure_agent_file_logging(
-    path: str,
+    path: Optional[str],
     level: int = logging.INFO,
     max_bytes: int = 20 * 1024 * 1024,
     backup_count: int = 3,
-) -> Path:
-    """Send verbose Agent step/event logs to a rotating file only."""
+) -> Optional[Path]:
+    """Configure rotating Agent logs, or disable them when ``path`` is empty."""
 
-    log_path = Path(path).expanduser().resolve()
-    log_path.parent.mkdir(parents=True, exist_ok=True)
     for handler in list(LOGGER.handlers):
         if getattr(handler, "_fastdllm_agent_file", False):
             LOGGER.removeHandler(handler)
             handler.close()
+    if not path:
+        LOGGER.setLevel(logging.NOTSET)
+        LOGGER.propagate = True
+        return None
+
+    log_path = Path(path).expanduser().resolve()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     handler = RotatingFileHandler(
         log_path,
         maxBytes=max_bytes,

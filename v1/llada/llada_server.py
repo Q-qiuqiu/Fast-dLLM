@@ -29,6 +29,7 @@ from json_agent_priority import (
 )
 from model.modeling_llada import LLaDAModelLM
 from planner_json_repair import repair_plan_json_response
+from planner_policy import apply_planner_prompt_policy
 
 
 DEFAULT_AGENT_NAMES = [
@@ -231,41 +232,14 @@ class LLaDAPlannerRuntime:
         request_agent_names = extract_agent_registry(
             messages, self.config.agent_names
         )
-        if self.config.policy in {"mid", "now"}:
-            registry = ", ".join(request_agent_names)
-            planner_instruction = {
-                "role": "system",
-                "content": (
-                    "Return a normal planner response with no private routing tags. "
-                    "Write PLAN_JSON before PLANNING_REASONING. In PLAN_JSON, use a "
-                    "compact JSON array without Markdown fences or indentation. Every "
-                    "object must put the agent field first and use this exact prefix: "
-                    "{\"agent\":\"<name>\",. Follow it with id, task, reason, and dep. "
-                    f"Agent names must be selected from: {registry}. Preserve the "
-                    "query's dates and numeric constraints verbatim. Do not create "
-                    "duplicate subtasks. Every object must explicitly include reason "
-                    "and dep; use dep:[] for independent tasks. Follow the caller's "
-                    "Agent capability and routing descriptions exactly. When a "
-                    "required external fact is absent from the supplied query or "
-                    "context, first create a fact-acquisition subtask using the "
-                    "caller's search, retrieval, or context Agent as appropriate. "
-                    "Never ask a math, calculation, code, or reasoning Agent to "
-                    "discover an absent external fact; computational Agents may use "
-                    "only values present in the request or produced by dependencies. "
-                    "In particular, a country's population for a named year is an "
-                    "external fact when its numeric value is not supplied: create a "
-                    "search subtask for each required country before any arithmetic. "
-                    "Use exactly one "
-                    "standalone marker of each kind, in this order: PLAN_JSON, "
-                    "END_PLAN_JSON, PLANNING_REASONING, END_PLANNING_REASONING. "
-                    "END_PLANNING_REASONING must be the final output line."
-                ),
-            }
-            first_user = next(
-                (index for index, message in enumerate(messages) if message["role"] == "user"),
-                len(messages),
-            )
-            messages.insert(first_user, planner_instruction)
+        # planreason is the former ``now`` policy. reasonplan returns an
+        # equivalent copy here, leaving the caller's reasoning-first prompt free
+        # of contradictory server-side ordering instructions.
+        messages = apply_planner_prompt_policy(
+            messages,
+            self.config.policy,
+            request_agent_names,
+        )
         rendered_prompt = self.tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
@@ -277,7 +251,7 @@ class LLaDAPlannerRuntime:
         ).input_ids.to(self.device)
         mask_id = self.tokenizer.mask_token_id or 126336
         controller = None
-        if self.config.policy == "now":
+        if self.config.policy in {"planreason", "reasonplan"}:
             controller = JsonAgentFieldController(
                 tokenizer=self.tokenizer,
                 config=JsonAgentPriorityConfig(
@@ -333,7 +307,11 @@ class LLaDAPlannerRuntime:
             "method": "disabled",
             "operations": [],
         }
-        if self.config.plan_json_repair and self.config.policy in {"mid", "now"}:
+        if self.config.plan_json_repair and self.config.policy in {
+            "mid",
+            "planreason",
+            "reasonplan",
+        }:
             content, repair_report = repair_plan_json_response(
                 content, request_agent_names
             )
@@ -365,6 +343,7 @@ class LLaDAPlannerRuntime:
         }
         if controller is not None:
             metrics["agent_priority"] = controller.metrics()
+            metrics["agent_priority"]["policy"] = self.config.policy
         return content, usage, metrics
 
 
@@ -597,16 +576,25 @@ def parse_args():
     )
     parser.add_argument(
         "--policy",
-        choices=("raw", "mid", "now"),
-        default="now",
-        help="raw=unchanged prompt, mid=JSON planner prompt, now=JSON Agent-priority decoding.",
+        choices=("raw", "mid", "planreason", "reasonplan"),
+        default="planreason",
+        help=(
+            "raw=unchanged prompt; mid=plan-first planner prompt without Agent "
+            "priority; planreason=plan-first Agent-priority decoding (formerly "
+            "now); reasonplan=preserve the caller's reasoning-first prompt and "
+            "use full-sequence logits to recognize later PLAN Agent fields as "
+            "early as confidence permits."
+        ),
     )
     parser.add_argument("--api_key", default=None)
     parser.add_argument("--log_level", default="info")
     parser.add_argument(
         "--agent_log_path",
-        default="agent_decode.log",
-        help="File for verbose Agent step/event logs (rotates at 20 MiB).",
+        default=None,
+        help=(
+            "Optional file for verbose Agent step/event logs (rotates at 20 MiB). "
+            "Disabled by default."
+        ),
     )
     parser.add_argument(
         "--agent_timing_log_path",

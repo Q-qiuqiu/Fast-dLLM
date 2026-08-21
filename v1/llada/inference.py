@@ -97,18 +97,22 @@ def parse_args(argv=None):
     parser.add_argument("--cache-mode", choices=("none", "prefix", "dual"), default="dual")
     parser.add_argument(
         "--policy",
-        choices=("raw", "mid", "now"),
-        default="now",
+        choices=("raw", "mid", "planreason"),
+        default="planreason",
         help=(
             "raw: query prompt + original decoder; mid: planner prompt + "
-            "original decoder; now: planner prompt + Agent-priority decoder."
+            "original decoder; planreason: planner prompt + Agent-priority "
+            "decoder (formerly now)."
         ),
     )
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument(
         "--agent-log-path",
-        default="agent_decode.log",
-        help="File for verbose per-step Agent logs (rotates at 20 MiB).",
+        default=None,
+        help=(
+            "Optional file for verbose per-step Agent logs (rotates at 20 MiB). "
+            "Disabled by default."
+        ),
     )
     parser.add_argument(
         "--save-step-trace",
@@ -150,7 +154,7 @@ def main():
     mask_id = tokenizer.mask_token_id or 126336
 
     controller = None
-    if args.policy == "now":
+    if args.policy == "planreason":
         controller = AgentDecodingController(
             tokenizer=tokenizer,
             config=AgentPriorityConfig(catalog=catalog, slots=4),
@@ -200,7 +204,7 @@ def main():
             trace_writer.close()
     elapsed = time.perf_counter() - started
 
-    if args.policy == "now":
+    if args.policy == "planreason":
         print(controller.plan(output).render())
         controller.dispatcher.drain()
     else:
